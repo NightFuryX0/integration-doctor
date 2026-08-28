@@ -289,9 +289,40 @@ def main() -> int:
             print("No findings.")
         return EXIT_CLEAN
 
+    severity_counts = {
+        "CRITICAL": 0,
+        "HIGH": 0,
+        "MEDIUM": 0,
+        "LOW": 0,
+        "ERROR": 0,
+    }
+
+    for finding in findings:
+        severity = finding.get("severity", "UNKNOWN")
+        if severity in severity_counts:
+            severity_counts[severity] += 1
+
+    summary = {
+        "total": len(findings),
+        "files": len({finding.get("file") for finding in findings}),
+        "critical": severity_counts["CRITICAL"],
+        "high": severity_counts["HIGH"],
+        "medium": severity_counts["MEDIUM"],
+        "low": severity_counts["LOW"],
+        "errors": severity_counts["ERROR"],
+    }
+
     if args.json and not args.ai:
-        print(json.dumps({"findings": findings, "summary": {
-              "total": len(findings)}}, indent=2, default=str))
+        print(
+            json.dumps(
+                {
+                    "findings": findings,
+                    "summary": summary,
+                },
+                indent=2,
+                default=str,
+            )
+        )
         return EXIT_FINDINGS
 
     _print_header("STATIC ANALYSIS")
