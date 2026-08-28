@@ -1,6 +1,6 @@
 import ast
 from pathlib import Path
-
+import re
 
 MAX_FILES = 5
 MAX_TOTAL_CHARS = 30_000
@@ -25,6 +25,25 @@ IGNORED_FILES = {
     "service-account.json",
 }
 
+SECRET_PATTERNS = [
+    # Fixed: detect common secret/token/password assignments while preserving the variable name.
+    re.compile(
+        r'(?i)(\b(?:api[_-]?key|secret[_-]?key|access[_-]?token|auth[_-]?token|password)\b'
+        r'\s*[:=]\s*)["\']([^"\']+)["\']'
+    ),
+
+    # Fixed: detect common Stripe secret-key values.
+    re.compile(
+        r'\bsk_(?:live|test)_[A-Za-z0-9]+\b'
+    ),
+
+    # Fixed: detect PEM private-key blocks before they can reach the AI.
+    re.compile(
+        r'-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----',
+        re.DOTALL,
+    ),
+]
+
 
 def _is_sensitive_file(path: Path) -> bool:
     """Return True when a file should never be included in AI context."""
@@ -42,6 +61,23 @@ def _is_sensitive_file(path: Path) -> bool:
         return True
 
     return False
+
+
+def _redact_secrets(source: str) -> str:
+    """Replace likely secrets before source code is sent to the AI."""
+
+    # Fixed: replace assignment-style secrets while preserving the code structure.
+    for pattern in SECRET_PATTERNS:
+        source = pattern.sub(
+            lambda match: (
+                f'{match.group(1)}"[REDACTED_SECRET]"'
+                if match.lastindex and match.lastindex >= 2
+                else "[REDACTED_SECRET]"
+            ),
+            source,
+        )
+
+    return source
 
 
 def build_repository_context(
@@ -123,6 +159,7 @@ def build_repository_context(
             break
         try:
             source = path.read_text(encoding="utf-8")
+            source = _redact_secrets(source)
         except (UnicodeDecodeError, OSError):
             continue
 

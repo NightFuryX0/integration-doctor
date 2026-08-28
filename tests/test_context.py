@@ -184,3 +184,59 @@ def test_context_excludes_symlink_that_points_outside_repository(tmp_path):
 
     # The outside file must never enter the AI context.
     assert outside_file.resolve() not in context_files
+
+
+def test_context_redacts_secret_assignment(tmp_path):
+    # Fixed: create a normal source file containing a secret-like value.
+    source_file = tmp_path / "app.py"
+
+    source_file.write_text(
+        'API_KEY = "super-secret-api-key"\n'
+        'print("hello")\n',
+        encoding="utf-8",
+    )
+
+    # Fixed: build context from the repository containing the source file.
+    context = build_repository_context(
+        str(source_file),
+        str(tmp_path),
+    )
+
+    # Fixed: verify that the source was included in the context.
+    assert len(context) == 1
+
+    source = context[0]["source"]
+
+    # Fixed: verify that the actual secret never appears in AI context.
+    assert "super-secret-api-key" not in source
+
+    # Fixed: verify that the redaction marker is present.
+    assert "[REDACTED_SECRET]" in source
+
+    # Fixed: verify that useful surrounding code remains available.
+    assert 'print("hello")' in source
+
+
+def test_context_does_not_redact_normal_code(tmp_path):
+    # Fixed: create ordinary source code that should remain untouched.
+    source_file = tmp_path / "app.py"
+
+    original_source = (
+        'api_url = "https://api.example.com"\n'
+        'timeout = 30\n'
+        'message = "hello"\n'
+    )
+
+    source_file.write_text(
+        original_source,
+        encoding="utf-8",
+    )
+
+    # Fixed: build context from the repository containing the ordinary source.
+    context = build_repository_context(
+        str(source_file),
+        str(tmp_path),
+    )
+
+    # Fixed: verify that ordinary source was not unnecessarily redacted.
+    assert context[0]["source"] == original_source
