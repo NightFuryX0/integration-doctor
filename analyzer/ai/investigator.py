@@ -157,7 +157,13 @@ class GeminiInvestigator:
             source_truncated=source_truncated,
         )
 
-        response = self._call_with_retries(prompt)
+        response = self._call_with_retries(
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=InvestigationResult,
+            ),
+        )
 
         if not response.parsed:
             raw_response = getattr(
@@ -199,55 +205,63 @@ class GeminiInvestigator:
 
         return result
 
-    def _call_with_retries(self, prompt: str):
-        """Call Gemini and retry failed requests a limited number of times.
+    def _call_with_retries(
+        self,
+        *,
+        contents: str,
+        config: types.GenerateContentConfig,
+    ) -> types.GenerateContentResponse:
+        """Call Gemini with bounded retries for transient failures."""
 
-        BUG FIX (#3): the original code only caught `APIError`. Timeouts,
-        connection resets, and other transport-layer failures from the SDK
-        do not necessarily subclass `APIError`, so they propagated straight
-        out of this function and would crash the CLI's scan loop mid-scan.
-        We now catch any exception raised by the SDK call, retry it the same
-        way, and wrap whatever we last saw in `InvestigatorAPIError`.
-        """
+        # FIX: indentation restored so the retry logic belongs to the method.
+        last_error = None
 
-        last_error: Optional[BaseException] = None
-        total_attempts = self.max_retries + 1
-
-        for attempt in range(1, total_attempts + 1):
+        for attempt in range(self.max_retries + 1):
             try:
                 return self.client.models.generate_content(
+                    # FIX: use self.model, which is defined in __init__.
                     model=self.model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=InvestigationResult,
-                        automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                            disable=True,
-                        ),
-                    ),
+                    contents=contents,
+                    config=config,
                 )
 
-            except Exception as exc:
-                last_error = exc
+            except APIError as error:
+                # FIX: permanent 4xx API errors should not be pointlessly retried.
+                if error.code < 500 and error.code != 429:
+                    raise InvestigatorAPIError(
+                        f"Gemini request failed with "
+                        f"{error.code} {error.status}: {error.message}"
+                    ) from error
 
-                is_api_error = isinstance(exc, APIError)
+                # 429 and 5xx errors may be temporary, so allow retries.
+                last_error = error
+
+            except (
+                ConnectionError,
+                TimeoutError,
+            ) as error:
+                # Network and timeout failures are commonly temporary.
+                last_error = error
+
+            except Exception as error:
+                # Preserve bounded retry behavior for unexpected SDK failures.
+                last_error = error
+
+            if attempt < self.max_retries:
+                delay = self.retry_backoff_seconds * (2**attempt)
 
                 logger.warning(
-                    "Gemini request failed (attempt %d/%d)%s: %s",
-                    attempt,
-                    total_attempts,
-                    "" if is_api_error else " [non-APIError exception]",
-                    exc,
+                    "Gemini request failed (attempt %s/%s): %s",
+                    attempt + 1,
+                    self.max_retries + 1,
+                    last_error,
                 )
 
-                if attempt < total_attempts:
-                    time.sleep(
-                        self.retry_backoff_seconds * attempt
-                    )
+                time.sleep(delay)
 
         raise InvestigatorAPIError(
-            f"Gemini API call failed after "
-            f"{total_attempts} attempts: {last_error}"
+            f"Gemini request failed after "
+            f"{self.max_retries + 1} attempts: {last_error}"
         ) from last_error
 
     def _build_prompt(
@@ -261,12 +275,7 @@ class GeminiInvestigator:
         """Build the complete prompt sent to Gemini."""
 
         # BUG FIX (#4): truncation of the main source now happens in
-        # investigate_file()/the caller via a bounded read, so by the time
-        # source_code gets here it is already <= MAX_SOURCE_CHARS. We still
-        # defensively re-slice in case investigate() is called directly with
-        # an untruncated string, and we rely on the `source_truncated` flag
-        # (rather than re-deriving it from length) so callers that already
-        # know the real on-disk truncation status can tell us accurately.
+        # investigate_file()/the caller via a bounded read.
         truncated_here = len(source_code) > MAX_SOURCE_CHARS
         code_for_prompt = source_code[:MAX_SOURCE_CHARS]
         is_truncated = source_truncated or truncated_here

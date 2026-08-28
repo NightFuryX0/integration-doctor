@@ -15,6 +15,34 @@ IGNORED_DIRECTORIES = {
     "tests",
 }
 
+IGNORED_FILES = {
+    ".env",
+    ".env.local",
+    ".env.production",
+    ".env.development",
+    ".env.test",
+    "credentials.json",
+    "service-account.json",
+}
+
+
+def _is_sensitive_file(path: Path) -> bool:
+    """Return True when a file should never be included in AI context."""
+
+    # Fixed: block explicitly known credential/config files.
+    if path.name in IGNORED_FILES:
+        return True
+
+    # Fixed: block all environment files such as .env.local or .env.production.
+    if path.name == ".env" or path.name.startswith(".env."):
+        return True
+
+    # Fixed: block common private-key file types, regardless of capitalization.
+    if path.suffix.lower() in {".pem", ".key"}:
+        return True
+
+    return False
+
 
 def build_repository_context(
     file_path: str,
@@ -87,9 +115,12 @@ def build_repository_context(
         ):
             continue
 
+        # Fixed: use the centralized sensitive-file check.
+        if _is_sensitive_file(path):
+            continue
+
         if len(selected_files) >= MAX_FILES:
             break
-
         try:
             source = path.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):
