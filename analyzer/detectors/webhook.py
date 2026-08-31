@@ -1,93 +1,383 @@
+"""Static-analysis detector for webhook signature verification issues.
+
+This module implements a lightweight, AST-based scanner that flags webhook
+handlers which either:
+
+* Never verify the authenticity of an incoming payload at all
+  (``WEBHOOK-001`` / ``MISSING_WEBHOOK_SIGNATURE``), or
+* Read a signature header but only perform a superficial check on it (e.g.
+  a truthiness test or a non-constant-time ``==`` comparison) instead of a
+  real cryptographic verification (``WEBHOOK-003`` /
+  ``WEAK_WEBHOOK_SIGNATURE_VERIFICATION``).
+
+Design notes / known limitations
+---------------------------------
+This is a heuristic textual/AST pattern matcher, not a data-flow analyzer.
+It cannot follow a signature value across variable reassignment chains,
+through helper modules, or across function boundaries. Treat findings as
+leads for review, not as ground truth, and expect some false negatives on
+unusual code shapes.
+"""
+
+from __future__ import annotations
+
 import ast
+import re
 from pathlib import Path
+from typing import Iterable, Iterator
+
+# --- Rule identifiers ----------------------------------------------------
+
+RULE_MISSING_SIGNATURE = "WEBHOOK-001"
+RULE_WEAK_SIGNATURE = "WEBHOOK-003"
+
+SEVERITY_CRITICAL = "CRITICAL"
+SEVERITY_HIGH = "HIGH"
+
+# Substrings (already lower-cased) that indicate code is reading a webhook
+# signature value. Kept broad to cover common providers and frameworks.
+_SIGNATURE_INDICATORS = (
+    "x-signature",
+    "x-webhook-signature",
+    "x-hub-signature",
+    "stripe-signature",
+    "razorpay-signature",
+    "svix-signature",
+    "http_x_signature",
+    "http_x_webhook_signature",
+    "signature",
+)
+
+# Substrings indicating the value is being pulled out of request
+# headers/metadata (as opposed to, say, a signature computed locally).
+_HEADER_ACCESS_INDICATORS = ("headers", "meta", "header")
+
+# Calls that represent an actual constant-time / cryptographic comparison.
+_CRYPTOGRAPHIC_VERIFICATION_INDICATORS = (
+    "hmac.compare_digest",
+    "compare_digest",
+    "secrets.compare_digest",
+)
+
+# SDK/helper call names that are trusted to perform full verification
+# themselves (they raise/return falsy on an invalid signature), even
+# without an explicit local crypto comparison visible in this function.
+_TRUSTED_VERIFICATION_HELPERS = (
+    "construct_event",  # e.g. stripe.Webhook.construct_event(...)
+    "verify_webhook",
+    "verify_payload",
+    "validate_webhook",
+    "verify_signature",
+    "verify_header",
+)
+
+_WEBHOOK_NAME_INDICATOR = "webhook"
+
+
+def _safe_unparse(node: ast.AST) -> str:
+    """``ast.unparse`` lower-cased, tolerant of exotic/unsupported nodes."""
+    try:
+        return ast.unparse(node).lower()
+    except Exception:
+        return ""
+
+
+def _contains_identifier(text: str, name: str) -> bool:
+    """Whole-word (identifier) match, so 'sig' doesn't match 'signature_ok'."""
+    return re.search(rf"\b{re.escape(name.lower())}\b", text) is not None
 
 
 class WebhookDetector(ast.NodeVisitor):
+    """Walks a module's AST looking for weak/missing webhook verification."""
+
     def __init__(self, file_path: str):
         self.file_path = file_path
-        self.findings = []
+        self.findings: list[dict] = []
 
-    def visit_FunctionDef(self, node: ast.FunctionDef):
-        if self._is_webhook_endpoint(node):
-            if not self._has_signature_verification(node):
-                self.findings.append(
-                    {
-                        "rule_id": "WEBHOOK-001",
-                        "type": "MISSING_WEBHOOK_SIGNATURE",
-                        "severity": "CRITICAL",
-                        "file": self.file_path,
-                        "line": node.lineno,
-                        "message": (
-                            "Webhook endpoint processes incoming payment "
-                            "events without apparent signature verification."
-                        ),
-                    }
-                )
+    # -- visitor entry points ---------------------------------------------
 
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._check_function(node)
         self.generic_visit(node)
 
-    def _is_webhook_endpoint(self, node: ast.FunctionDef) -> bool:
-        if "webhook" in node.name.lower():
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._check_function(node)
+        self.generic_visit(node)
+
+    # -- core decision logic ------------------------------------------------
+
+    def _check_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        if not self._is_webhook_endpoint(node):
+            return
+
+        signature_vars = self._find_signature_variable_names(node)
+        has_header_read = self._has_signature_header_read(node, signature_vars)
+        has_crypto_verification = self._has_cryptographic_verification(
+            node, signature_vars
+        )
+
+        if has_crypto_verification:
+            return  # properly verified: no finding
+
+        if has_header_read and self._has_weak_signature_usage(node, signature_vars):
+            self._add_finding(
+                rule_id=RULE_WEAK_SIGNATURE,
+                finding_type="WEAK_WEBHOOK_SIGNATURE_VERIFICATION",
+                severity=SEVERITY_HIGH,
+                line=node.lineno,
+                message=(
+                    "Webhook endpoint reads a signature but does not appear "
+                    "to perform cryptographic signature verification."
+                ),
+            )
+            return
+
+        self._add_finding(
+            rule_id=RULE_MISSING_SIGNATURE,
+            finding_type="MISSING_WEBHOOK_SIGNATURE",
+            severity=SEVERITY_CRITICAL,
+            line=node.lineno,
+            message=(
+                "Webhook endpoint processes incoming payment events without "
+                "apparent signature verification."
+            ),
+        )
+
+    def _add_finding(
+        self, *, rule_id: str, finding_type: str, severity: str, line: int, message: str
+    ) -> None:
+        self.findings.append(
+            {
+                "rule_id": rule_id,
+                "type": finding_type,
+                "severity": severity,
+                "file": self.file_path,
+                "line": line,
+                "message": message,
+            }
+        )
+
+    # -- endpoint identification --------------------------------------------
+
+    def _is_webhook_endpoint(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+        if _WEBHOOK_NAME_INDICATOR in node.name.lower():
             return True
 
         for decorator in node.decorator_list:
-            decorator_source = ast.unparse(decorator).lower()
-
-            if "webhook" in decorator_source:
+            if _WEBHOOK_NAME_INDICATOR in _safe_unparse(decorator):
                 return True
 
         return False
 
-    def _has_signature_verification(self, node: ast.FunctionDef) -> bool:
-        verification_indicators = (
-            "verify_signature",
-            "verify_webhook",
-            "signature",
-            "hmac",
-            "compare_digest",
-        )
+    # -- call/assignment scanning helpers -----------------------------------
 
+    def _iter_calls(self, node: ast.AST) -> Iterator[ast.Call]:
         for child in ast.walk(node):
             if isinstance(child, ast.Call):
-                call_source = ast.unparse(child).lower()
+                yield child
 
-                if any(
-                    indicator in call_source
-                    for indicator in verification_indicators
-                ):
-                    return True
+    def _looks_like_signature_header_read(self, call: ast.Call) -> bool:
+        """True for a call that is *itself* a header lookup carrying a
+        signature, e.g. ``request.headers.get("X-Signature")``.
+
+        Only the call's own callee and arguments are inspected (not the
+        full recursively-unparsed subtree), so a call that merely *contains*
+        a header lookup as one argument among others — e.g.
+        ``stripe.Webhook.construct_event(body, request.headers.get(...), secret)``
+        — is correctly NOT treated as itself being a header read.
+        """
+        func_source = _safe_unparse(call.func)
+        if not func_source or not any(
+            indicator in func_source for indicator in _HEADER_ACCESS_INDICATORS
+        ):
+            return False
+
+        arg_sources = [_safe_unparse(a) for a in call.args]
+        arg_sources.extend(_safe_unparse(kw.value) for kw in call.keywords)
+        args_text = " ".join(arg_sources)
+        return any(indicator in args_text for indicator in _SIGNATURE_INDICATORS)
+
+    def _find_signature_variable_names(
+        self, node: ast.FunctionDef | ast.AsyncFunctionDef
+    ) -> set[str]:
+        """Collect names of local variables assigned from a header read that
+        looks like a webhook signature, e.g. ``sig = request.headers.get(...)``.
+        """
+        names: set[str] = set()
+        for child in ast.walk(node):
+            value = None
+            targets: Iterable[ast.expr] = ()
+
+            if isinstance(child, ast.Assign):
+                value = child.value
+                targets = child.targets
+            elif isinstance(child, (ast.AnnAssign, ast.NamedExpr)):
+                value = child.value
+                targets = [child.target]
+
+            if not isinstance(value, ast.Call):
+                continue
+            if not self._looks_like_signature_header_read(value):
+                continue
+
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    names.add(target.id)
+
+        return names
+
+    def _has_signature_header_read(
+        self, node: ast.AST, signature_vars: set[str]
+    ) -> bool:
+        if signature_vars:
+            return True
+        return any(self._looks_like_signature_header_read(c) for c in self._iter_calls(node))
+
+    def _has_cryptographic_verification(
+        self, node: ast.AST, signature_vars: set[str]
+    ) -> bool:
+        """True only if a real verification call is found, and — when we
+        know the signature's variable name — that call actually references
+        it. This prevents an unrelated ``compare_digest`` call elsewhere in
+        the function from masking a genuinely unverified signature.
+        """
+        for call in self._iter_calls(node):
+            source = _safe_unparse(call)
+            if not source:
+                continue
+
+            is_crypto_call = any(
+                ind in source for ind in _CRYPTOGRAPHIC_VERIFICATION_INDICATORS
+            )
+            is_trusted_helper = any(
+                ind in source for ind in _TRUSTED_VERIFICATION_HELPERS
+            )
+            if not (is_crypto_call or is_trusted_helper):
+                continue
+
+            if not signature_vars:
+                return True
+            if any(_contains_identifier(source, var) for var in signature_vars):
+                return True
+
+        return False
+
+    def _has_weak_signature_usage(
+        self, node: ast.AST, signature_vars: set[str]
+    ) -> bool:
+        """True if the signature is referenced in a conditional/boolean/
+        comparison context without ever going through real verification
+        (covers both truthiness checks like ``if signature:`` and
+        timing-unsafe checks like ``signature == expected``).
+        """
+        candidates: list[ast.AST] = []
+        for child in ast.walk(node):
+            if isinstance(child, (ast.If, ast.IfExp)):
+                candidates.append(child.test)
+            elif isinstance(child, ast.Assert):
+                candidates.append(child.test)
+            elif isinstance(child, ast.BoolOp):
+                candidates.append(child)
+            elif isinstance(child, ast.Compare):
+                candidates.append(child)
+            elif isinstance(child, ast.UnaryOp) and isinstance(child.op, ast.Not):
+                candidates.append(child)
+
+        for candidate in candidates:
+            text = _safe_unparse(candidate)
+            if not text:
+                continue
+
+            if signature_vars and any(
+                _contains_identifier(text, var) for var in signature_vars
+            ):
+                return True
+
+            if not signature_vars and any(
+                ind in text for ind in _SIGNATURE_INDICATORS
+            ) and any(ind in text for ind in _HEADER_ACCESS_INDICATORS):
+                return True
 
         return False
 
 
 def analyze_file(file_path: str) -> list[dict]:
+    """Parse ``file_path`` and return a list of webhook-signature findings.
+
+    Raises:
+        FileNotFoundError: if ``file_path`` does not exist.
+        SyntaxError: if the file is not valid Python source.
+        UnicodeDecodeError: if the file cannot be decoded as UTF-8.
+    """
     path = Path(file_path)
 
-    source = path.read_text(encoding="utf-8")
+    if not path.is_file():
+        raise FileNotFoundError(f"No such file: {file_path!r}")
 
-    tree = ast.parse(source, filename=str(path))
+    try:
+        source = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise UnicodeDecodeError(
+            exc.encoding,
+            exc.object,
+            exc.start,
+            exc.end,
+            f"{file_path}: {exc.reason} (file must be UTF-8 encoded)",
+        ) from exc
+
+    try:
+        tree = ast.parse(source, filename=str(path))
+    except SyntaxError as exc:
+        raise SyntaxError(
+            f"{file_path}: {exc.msg} (line {exc.lineno})") from exc
 
     analyzer = WebhookDetector(str(path))
     analyzer.visit(tree)
-
     return analyzer.findings
 
 
-if __name__ == "__main__":
-    target = "integrations/broken_webhook/app.py"
+def _format_finding(finding: dict) -> str:
+    return (
+        f"[{finding['severity']}] {finding['rule_id']} {finding['type']}\n"
+        f"  {finding['file']}:{finding['line']}\n"
+        f"  {finding['message']}"
+    )
 
-    findings = analyze_file(target)
+
+def _main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Scan a Python file for missing/weak webhook signature verification."
+    )
+    parser.add_argument(
+        "target",
+        nargs="?",
+        default="integrations/broken_webhook/app.py",
+        help="Path to the Python file to analyze.",
+    )
+    args = parser.parse_args()
+
+    try:
+        findings = analyze_file(args.target)
+    except (FileNotFoundError, SyntaxError, UnicodeDecodeError) as exc:
+        print(f"Error: {exc}")
+        return 2
 
     if not findings:
         print("No findings.")
+        return 0
 
     for finding in findings:
-        print(
-            f"[{finding['severity']}] "
-            f"{finding['rule_id']} "
-            f"{finding['type']}"
-        )
-        print(
-            f"  {finding['file']}:{finding['line']}"
-        )
-        print(f"  {finding['message']}")
+        print(_format_finding(finding))
+
+    return 1 if any(f["severity"] == SEVERITY_CRITICAL for f in findings) else 0
+
+
+# Public alias: backward-compatible entry points (e.g. webhook_analyzer.py)
+# should call `main()` rather than reaching into the private `_main`.
+main = _main
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

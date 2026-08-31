@@ -111,7 +111,14 @@ def build_repository_context(
     # Always start with the file that produced the finding.
     files.append(target)
 
-    # Add files imported directly by the target file.
+    # NEW: Add files imported by the target file, and files imported BY
+    # those files, and so on (bounded by MAX_FILES). This is what lets a
+    # webhook handler that calls process_payment() (imported from
+    # payment.py) also pull in security.py, if payment.py in turn imports
+    # verify_signature() from there. Previously this only resolved one
+    # level of imports -- the target's own -- so a security control
+    # implemented two files away from the finding never reached the AI
+    # investigator, and the model had no choice but to guess.
     files.extend(
         _find_imported_local_files(
             target=target,
@@ -191,38 +198,73 @@ def _find_imported_local_files(
     target: Path,
     repository_root: Path,
 ) -> list[Path]:
-    """Resolve simple local imports used by the target file."""
+    """Resolve local imports used by the target file, transitively.
 
-    try:
-        source = target.read_text(encoding="utf-8")
-        tree = ast.parse(source, filename=str(target))
-    except (OSError, UnicodeDecodeError, SyntaxError):
-        return []
+    NEW: This now does a breadth-first walk of the local import graph
+    instead of only looking at the target file's own imports. For each
+    file we discover, we also parse *its* imports and queue up whatever
+    local modules it pulls in, and so on -- so `webhook.py` importing
+    `process_payment` from `payment.py`, which itself imports
+    `verify_signature` from `security.py`, now surfaces both files, not
+    just the first hop.
 
-    imported_files = []
+    Traversal is bounded by MAX_FILES (matching the cap already enforced
+    in build_repository_context) and each file is visited at most once,
+    so it terminates even on modules that import each other in a cycle.
+    Ordering is deterministic: imports are sorted before being queued, and
+    files are discovered in breadth-first (nearest-dependency-first) order.
+    """
 
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                imported_files.extend(
-                    _resolve_import(
-                        alias.name,
-                        target.parent,
-                        repository_root,
+    discovered: list[Path] = []
+    seen = {target}
+    queue = [target]
+
+    while queue and len(discovered) < MAX_FILES:
+        current = queue.pop(0)
+
+        try:
+            source = current.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=str(current))
+        except (OSError, UnicodeDecodeError, SyntaxError):
+            continue
+
+        direct_imports = []
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    direct_imports.extend(
+                        _resolve_import(
+                            alias.name,
+                            current.parent,
+                            repository_root,
+                        )
                     )
-                )
 
-        elif isinstance(node, ast.ImportFrom):
-            if node.module:
-                imported_files.extend(
-                    _resolve_import(
-                        node.module,
-                        target.parent,
-                        repository_root,
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    direct_imports.extend(
+                        _resolve_import(
+                            node.module,
+                            current.parent,
+                            repository_root,
+                        )
                     )
-                )
 
-    return imported_files
+        # Sorted for deterministic ordering; a set() also collapses any
+        # duplicate candidate paths _resolve_import may have produced.
+        for imported_path in sorted(set(direct_imports)):
+            if imported_path in seen:
+                continue
+
+            seen.add(imported_path)
+            discovered.append(imported_path)
+            queue.append(imported_path)
+
+            if len(discovered) >= MAX_FILES:
+                break
+
+    return discovered
 
 
 def _resolve_import(
@@ -258,3 +300,128 @@ def _is_inside_repository(
         return True
     except ValueError:
         return False
+
+
+def test_build_repository_context_includes_transitive_import_chain(tmp_path):
+    """webhook.py imports process_payment from payment.py, which imports
+    verify_signature from security.py -- both must be pulled in, not just
+    the file webhook.py imports directly."""
+
+    (tmp_path / "webhook.py").write_text(
+        "from payment import process_payment\n\n"
+        "@app.route(\"/webhook\", methods=[\"POST\"])\n"
+        "def webhook():\n"
+        "    data = request.get_json()\n"
+        "    process_payment(data)\n"
+    )
+    (tmp_path / "payment.py").write_text(
+        "from security import verify_signature\n\n"
+        "def process_payment(data):\n"
+        "    verify_signature(data)\n"
+        "    charge(data)\n"
+    )
+    (tmp_path / "security.py").write_text(
+        "def verify_signature(data):\n    return True\n"
+    )
+    (tmp_path / "unrelated.py").write_text(
+        "def unrelated():\n    pass\n"
+    )
+
+    context = build_repository_context(
+        file_path=str(tmp_path / "webhook.py"),
+        repository_root=str(tmp_path),
+    )
+
+    files_included = {Path(item["file"]).name for item in context}
+    assert "payment.py" in files_included
+    assert "security.py" in files_included
+
+
+def test_build_repository_context_prioritizes_dependency_chain_over_unrelated_sibling(tmp_path):
+    (tmp_path / "webhook.py").write_text(
+        "from payment import process_payment\n\ndef webhook():\n    process_payment({})\n"
+    )
+    (tmp_path / "payment.py").write_text(
+        "from security import verify_signature\n\ndef process_payment(data):\n    verify_signature(data)\n"
+    )
+    (tmp_path / "security.py").write_text(
+        "def verify_signature(data):\n    return True\n"
+    )
+    (tmp_path / "unrelated.py").write_text(
+        "def unrelated():\n    pass\n"
+    )
+
+    context = build_repository_context(
+        file_path=str(tmp_path / "webhook.py"),
+        repository_root=str(tmp_path),
+    )
+
+    names = [Path(item["file"]).name for item in context]
+    assert names.index("payment.py") < names.index("unrelated.py")
+    assert names.index("security.py") < names.index("unrelated.py")
+
+
+def test_build_repository_context_avoids_duplicate_entries(tmp_path):
+    (tmp_path / "webhook.py").write_text(
+        "from payment import process_payment\n\ndef webhook():\n    process_payment({})\n"
+    )
+    (tmp_path / "payment.py").write_text("def process_payment(data):\n    pass\n")
+
+    context = build_repository_context(
+        file_path=str(tmp_path / "webhook.py"),
+        repository_root=str(tmp_path),
+    )
+
+    files_seen = [item["file"] for item in context]
+    assert len(files_seen) == len(set(files_seen))
+
+
+def test_build_repository_context_handles_missing_import_gracefully(tmp_path):
+    (tmp_path / "webhook.py").write_text(
+        "from nonexistent_module import something\n\ndef webhook():\n    something()\n"
+    )
+
+    # Should not raise even though `nonexistent_module` can't be resolved.
+    context = build_repository_context(
+        file_path=str(tmp_path / "webhook.py"),
+        repository_root=str(tmp_path),
+    )
+
+    files_included = {Path(item["file"]).name for item in context}
+    assert "webhook.py" in files_included
+
+
+def test_build_repository_context_handles_circular_imports(tmp_path):
+    (tmp_path / "a.py").write_text(
+        "from b import helper_b\n\ndef helper_a():\n    return helper_b()\n"
+    )
+    (tmp_path / "b.py").write_text(
+        "from a import helper_a\n\ndef helper_b():\n    return 1\n"
+    )
+
+    # Must terminate rather than looping forever on the a <-> b cycle.
+    context = build_repository_context(
+        file_path=str(tmp_path / "a.py"),
+        repository_root=str(tmp_path),
+    )
+
+    files_included = {Path(item["file"]).name for item in context}
+    assert "a.py" in files_included
+    assert "b.py" in files_included
+
+
+def test_build_repository_context_still_bounded_by_max_files(tmp_path):
+    from analyzer.ai.context import MAX_FILES
+
+    (tmp_path / "m0.py").write_text("from m1 import x\ndef f(): x()\n")
+    for i in range(1, 8):
+        (tmp_path /
+         f"m{i}.py").write_text(f"from m{i+1} import x\ndef x(): pass\n")
+    (tmp_path / "m8.py").write_text("def x(): pass\n")
+
+    context = build_repository_context(
+        file_path=str(tmp_path / "m0.py"),
+        repository_root=str(tmp_path),
+    )
+
+    assert len(context) <= MAX_FILES
