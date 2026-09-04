@@ -66,7 +66,8 @@ def test_nvidia_investigator_returns_true_positive(monkeypatch):
     mock_client = MagicMock()
     monkeypatch.setattr(
         "analyzer.ai.investigator.OpenAI",
-        lambda api_key, base_url: mock_client,
+        # Accept the production client's timeout argument.
+        lambda api_key, base_url, timeout: mock_client,
     )
 
     mock_client.chat.completions.create.return_value = _mock_openai_response(
@@ -126,7 +127,8 @@ def test_nvidia_investigator_rejects_empty_response(monkeypatch):
     mock_client = MagicMock()
     monkeypatch.setattr(
         "analyzer.ai.investigator.OpenAI",
-        lambda api_key, base_url: mock_client,
+        # Accept the production client's timeout argument.
+        lambda api_key, base_url, timeout: mock_client,
     )
 
     empty_response = MagicMock()
@@ -157,7 +159,8 @@ def test_nvidia_investigator_rejects_malformed_json(monkeypatch):
     mock_client = MagicMock()
     monkeypatch.setattr(
         "analyzer.ai.investigator.OpenAI",
-        lambda api_key, base_url: mock_client,
+        # Accept the production client's timeout argument.
+        lambda api_key, base_url, timeout: mock_client,
     )
 
     bad_response = MagicMock()
@@ -188,7 +191,8 @@ def test_nvidia_investigator_rejects_invalid_schema(monkeypatch):
     mock_client = MagicMock()
     monkeypatch.setattr(
         "analyzer.ai.investigator.OpenAI",
-        lambda api_key, base_url: mock_client,
+        # Accept the production client's timeout argument.
+        lambda api_key, base_url, timeout: mock_client,
     )
 
     bad_response = MagicMock()
@@ -227,7 +231,8 @@ def test_nvidia_investigator_retries_on_503(monkeypatch):
     mock_client = MagicMock()
     monkeypatch.setattr(
         "analyzer.ai.investigator.OpenAI",
-        lambda api_key, base_url: mock_client,
+        # Accept the production client's timeout argument.
+        lambda api_key, base_url, timeout: mock_client,
     )
     monkeypatch.setattr(
         "analyzer.ai.investigator.time.sleep",
@@ -283,7 +288,8 @@ def test_nvidia_investigator_does_not_retry_permanent_400(monkeypatch):
     mock_client = MagicMock()
     monkeypatch.setattr(
         "analyzer.ai.investigator.OpenAI",
-        lambda api_key, base_url: mock_client,
+        # Accept the production client's timeout argument.
+        lambda api_key, base_url, timeout: mock_client,
     )
     monkeypatch.setattr(
         "analyzer.ai.investigator.time.sleep",
@@ -324,7 +330,8 @@ def test_nvidia_investigator_retries_on_rate_limit(monkeypatch):
     mock_client = MagicMock()
     monkeypatch.setattr(
         "analyzer.ai.investigator.OpenAI",
-        lambda api_key, base_url: mock_client,
+        # Accept the production client's timeout argument.
+        lambda api_key, base_url, timeout: mock_client,
     )
     monkeypatch.setattr(
         "analyzer.ai.investigator.time.sleep",
@@ -377,7 +384,8 @@ def test_nvidia_investigator_retries_network_disconnect(monkeypatch):
     mock_client = MagicMock()
     monkeypatch.setattr(
         "analyzer.ai.investigator.OpenAI",
-        lambda api_key, base_url: mock_client,
+        # Accept the production client's timeout argument.
+        lambda api_key, base_url, timeout: mock_client,
     )
     monkeypatch.setattr(
         "analyzer.ai.investigator.time.sleep",
@@ -429,7 +437,8 @@ def test_nvidia_investigator_stops_after_repeated_failures(monkeypatch):
     mock_client = MagicMock()
     monkeypatch.setattr(
         "analyzer.ai.investigator.OpenAI",
-        lambda api_key, base_url: mock_client,
+        # Accept the production client's timeout argument.
+        lambda api_key, base_url, timeout: mock_client,
     )
     monkeypatch.setattr(
         "analyzer.ai.investigator.time.sleep",
@@ -469,7 +478,8 @@ def test_build_investigator_defaults_to_nvidia_when_both_keys_present(monkeypatc
 
     monkeypatch.setattr(
         "analyzer.ai.investigator.OpenAI",
-        lambda api_key, base_url: MagicMock(),
+        # Accept the production client's explicit timeout argument.
+        lambda api_key, base_url, timeout: MagicMock(),
     )
 
     investigator = _build_investigator()

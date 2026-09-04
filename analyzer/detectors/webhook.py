@@ -97,8 +97,17 @@ class WebhookDetector(ast.NodeVisitor):
     def __init__(self, file_path: str):
         self.file_path = file_path
         self.findings: list[dict] = []
+        # NEW: keep the module AST available so webhook decorators can be
+        # resolved to their local implementations.
+        self._module_tree: ast.Module | None = None
 
     # -- visitor entry points ---------------------------------------------
+
+    def visit_Module(self, node: ast.Module) -> None:
+        # NEW: save the complete module tree before inspecting functions,
+        # so decorator implementations can be resolved locally.
+        self._module_tree = node
+        self.generic_visit(node)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._check_function(node)
@@ -127,7 +136,11 @@ class WebhookDetector(ast.NodeVisitor):
         # invisible to _has_cryptographic_verification (which only looks
         # at ast.Call nodes) -- a handler protected entirely by a bare
         # decorator would have been flagged as MISSING_WEBHOOK_SIGNATURE.
-        if has_crypto_verification or self._has_verification_decorator(node):
+        if (
+            has_crypto_verification
+            or self._has_verification_decorator(node)
+            or self._has_verified_local_decorator(node)
+        ):
             return  # properly verified: no finding
 
         if has_header_read and self._has_weak_signature_usage(node, signature_vars):
@@ -181,6 +194,7 @@ class WebhookDetector(ast.NodeVisitor):
         return False
 
     def _has_verification_decorator(
+
         self, node: ast.FunctionDef | ast.AsyncFunctionDef
     ) -> bool:
         """True if the function is itself wrapped by something that looks
@@ -194,6 +208,126 @@ class WebhookDetector(ast.NodeVisitor):
                 continue
             if any(ind in decorator_text for ind in _TRUSTED_VERIFICATION_HELPERS):
                 return True
+
+        return False
+
+    def _has_verified_local_decorator(
+        self, node: ast.FunctionDef | ast.AsyncFunctionDef
+    ) -> bool:
+        """Return True when a locally defined decorator performs real
+        signature verification and only calls the wrapped handler after
+        successful verification.
+        """
+        if self._module_tree is None:
+            return False
+
+        for decorator in node.decorator_list:
+            if not isinstance(decorator, ast.Name):
+                continue
+
+            decorator_definition = None
+
+            for definition in self._module_tree.body:
+                if (
+                    isinstance(
+                        definition, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and definition.name == decorator.id
+                ):
+                    decorator_definition = definition
+                    break
+
+            if decorator_definition is None:
+                continue
+
+            # A real decorator must perform cryptographic verification.
+            if not self._has_cryptographic_verification(
+                decorator_definition, set()
+            ):
+                continue
+
+            # The decorator must also call the wrapped function. Otherwise
+            # the verification code may be unrelated to the actual handler.
+            if not self._decorator_calls_wrapped_function(decorator_definition):
+                continue
+
+            # The wrapped function call must be reachable only after a
+            # verification failure has already been rejected. This keeps a
+            # crypto call by itself from being treated as an effective guard.
+            if self._decorator_call_is_after_rejection(
+                decorator_definition
+            ):
+                return True
+
+        return False
+
+    def _decorator_calls_wrapped_function(
+        self, decorator: ast.FunctionDef | ast.AsyncFunctionDef
+    ) -> bool:
+        """Return True when the decorator eventually calls its wrapped input."""
+        parameter_names = {argument.arg for argument in decorator.args.args}
+        if not parameter_names:
+            return False
+
+        for call in self._iter_calls(decorator):
+            call_source = _safe_unparse(call.func)
+            if any(
+                _contains_identifier(call_source, name)
+                for name in parameter_names
+            ):
+                return True
+
+        return False
+
+    def _decorator_call_is_after_rejection(
+        self, decorator: ast.FunctionDef | ast.AsyncFunctionDef
+    ) -> bool:
+        """Return True when a wrapped-function call follows a rejecting guard."""
+        wrapped_names = {argument.arg for argument in decorator.args.args}
+        if not wrapped_names:
+            return False
+
+        for child in ast.walk(decorator):
+            if not isinstance(child, ast.If):
+                continue
+
+            if not self._has_cryptographic_verification(child.test, set()):
+                continue
+
+            # A guard such as `if not compare_digest(...): return ...` is a
+            # strong signal that failed verification stops the request.
+            if not self._contains_termination(child.body):
+                continue
+
+            for call in self._iter_calls(decorator):
+                if not self._call_is_wrapped_function(call, wrapped_names):
+                    continue
+
+                if getattr(call, "lineno", 0) > getattr(child, "lineno", 0):
+                    return True
+
+        return False
+
+    def _call_is_wrapped_function(
+        self, call: ast.Call, wrapped_names: set[str]
+    ) -> bool:
+        return any(
+            isinstance(call.func, ast.Name) and call.func.id == name
+            for name in wrapped_names
+        )
+
+    def _contains_termination(self, statements: list[ast.stmt]) -> bool:
+        """Return True when a statement block contains request termination."""
+        for statement in statements:
+            if isinstance(statement, (ast.Return, ast.Raise)):
+                return True
+
+            # Common nested termination forms, while keeping this heuristic
+            # deliberately small and readable.
+            if isinstance(statement, ast.If):
+                if self._contains_termination(statement.body) or self._contains_termination(
+                    statement.orelse
+                ):
+                    return True
 
         return False
 

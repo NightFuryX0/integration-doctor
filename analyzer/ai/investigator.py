@@ -41,7 +41,6 @@ from google import genai
 from google.genai import types  # FIX: use the SDK's typed generation config
 from google.genai.errors import APIError
 from pydantic import BaseModel, Field
-
 from analyzer.ai.context import build_repository_context
 
 # NEW: NVIDIA's hosted NIM endpoint is OpenAI-compatible, so the `openai`
@@ -66,10 +65,10 @@ load_dotenv()
 logger = logging.getLogger("integration_doctor.investigator")
 
 # Keep the main source bounded so very large files do not create huge prompts.
-MAX_SOURCE_CHARS = 20_000
+MAX_SOURCE_CHARS = 8000
 
 # Keep all additional repository context bounded as well.
-MAX_CONTEXT_CHARS = 30_000
+MAX_CONTEXT_CHARS = 12_000
 
 # NEW: Explain why each detector rule fires so the AI does not have to
 # decide from scratch whether the security control is required.
@@ -890,7 +889,13 @@ class NvidiaInvestigator(BaseInvestigator):
                 "retry_backoff_seconds cannot be negative."
             )
 
-        self.client = OpenAI(api_key=api_key, base_url=self.BASE_URL)
+        # Set an explicit timeout so an NVIDIA request cannot hang indefinitely.
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url=self.BASE_URL,
+            timeout=60.0,
+        )
+
         self.model = model
         self.max_retries = max_retries
         self.retry_backoff_seconds = retry_backoff_seconds
@@ -1011,7 +1016,7 @@ class NvidiaInvestigator(BaseInvestigator):
                         }
                     ],
                     temperature=0.0,
-                    max_tokens=4096,
+                    max_tokens=2000,
                     response_format=self._response_format,
                     # Disable visible chain-of-thought so message.content
                     # holds only the structured JSON we asked for, per

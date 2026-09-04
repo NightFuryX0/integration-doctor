@@ -71,6 +71,102 @@ def webhook_handler(request):
     assert not any(finding["rule_id"] == "WEBHOOK-003" for finding in findings)
 
 
+def test_accepts_razorpay_hmac_verification_decorator(tmp_path):
+    webhook_file = tmp_path / "webhook.py"
+    webhook_file.write_text(
+        """
+import hashlib
+import hmac
+from functools import wraps
+
+WEBHOOK_SECRET = "secret"
+
+
+def verify_razorpay_signature(function):
+    @wraps(function)
+    def wrapper(request):
+        signature = request.headers.get("X-Razorpay-Signature")
+        if not signature:
+            return {"error": "Missing signature"}, 401
+
+        raw_body = request.get_data()
+
+        expected_signature = hmac.new(
+            key=WEBHOOK_SECRET.encode("utf-8"),
+            msg=raw_body,
+            digestmod=hashlib.sha256,
+        ).hexdigest()
+
+        if not hmac.compare_digest(expected_signature, signature):
+            return {"error": "Invalid signature"}, 401
+
+        return function(request)
+
+    return wrapper
+
+
+@verify_razorpay_signature
+def payment_webhook(request):
+    process_payment(request)
+"""
+    )
+
+    findings = analyze_file(str(webhook_file))
+
+    assert not any(
+        finding["rule_id"] == "WEBHOOK-001" for finding in findings
+    )
+    assert not any(
+        finding["rule_id"] == "WEBHOOK-003" for finding in findings
+    )
+
+
+def test_accepts_verified_webhook_decorator(tmp_path):
+    webhook_file = tmp_path / "webhook.py"
+    webhook_file.write_text(
+        """
+import hashlib
+import hmac
+from functools import wraps
+
+WEBHOOK_SECRET = "secret"
+
+
+def verify_webhook_signature(function):
+    @wraps(function)
+    def wrapper(request):
+        signature = request.headers.get("X-Webhook-Signature")
+        if not signature:
+            return {"error": "Missing signature"}, 401
+
+        expected = hmac.new(
+            WEBHOOK_SECRET.encode("utf-8"),
+            request.get_data(),
+            hashlib.sha256,
+        ).hexdigest()
+
+        if not hmac.compare_digest(expected, signature):
+            return {"error": "Invalid signature"}, 401
+
+        return function(request)
+
+    return wrapper
+
+
+@verify_webhook_signature
+def webhook_handler(request):
+    process_event(request)
+"""
+    )
+
+    findings = analyze_file(str(webhook_file))
+
+    assert not any(
+        finding["rule_id"] == "WEBHOOK-001" for finding in findings
+    )
+    assert not any(
+        finding["rule_id"] == "WEBHOOK-003" for finding in findings
+    )
 # --- Regression / hardening tests for the fixes made to the detector -----
 
 

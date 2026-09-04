@@ -129,25 +129,23 @@ It's specifically instructed not to just rubber-stamp the detector — if the co
 
 ### Providers
 
-Both Gemini and NVIDIA are supported:
+Both Gemini and NVIDIA are supported.
 
-```text
+The investigator can be configured through environment variables:
+
+````text
 AI_PROVIDER
 GEMINI_API_KEY
 GEMINI_MODEL
 NVIDIA_API_KEY
 NVIDIA_MODEL
-```
-
-If you don't set `AI_PROVIDER` explicitly, it'll pick whichever one has a configured key. Keep your keys in a `.env` file for local dev — don't commit them.
-
 ---
 
 ## JSON output
 
 ```bash
 python -m analyzer.scanner integrations/broken_webhook --json
-```
+````
 
 ```json
 {

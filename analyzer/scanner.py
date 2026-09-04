@@ -1,19 +1,30 @@
 from __future__ import annotations
+from analyzer.detectors.retry import analyze_file as analyze_retry
+from analyzer.detectors.idempotency import analyze_file as analyze_idempotency
+from analyzer.detectors.webhook import analyze_file as analyze_webhook
+from analyzer.ai.investigator import (
+    InvestigatorAPIError,
+    investigate_file,
+)
+from analyzer.ai.display import print_investigation
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 import argparse
 import ast
 import json
 import logging
 import os
-from pathlib import Path
 
-from analyzer.ai.investigator import (
-    InvestigatorAPIError,
-    investigate_file,
-)
-from analyzer.detectors.webhook import analyze_file as analyze_webhook
-from analyzer.detectors.idempotency import analyze_file as analyze_idempotency
-from analyzer.detectors.retry import analyze_file as analyze_retry
+# ANSI escape codes keep terminal colors lightweight without adding a dependency.
+RESET = "\033[0m"
+BOLD = "\033[1m"
+RED = "\033[31m"
+YELLOW = "\033[33m"
+BLUE = "\033[34m"
+GRAY = "\033[90m"
+CYAN = "\033[36m"
+GREEN = "\033[32m"
 
 
 IGNORED_DIRECTORIES = {
@@ -247,17 +258,39 @@ def group_findings_by_file(findings: list[dict]) -> dict[str, list[dict]]:
     return grouped
 
 
+def _severity_color(severity: str) -> str:
+    """Return the terminal color for a finding severity."""
+
+    colors = {
+        "CRITICAL": RED,
+        "HIGH": YELLOW,
+        "MEDIUM": BLUE,
+        "LOW": GRAY,
+        "ERROR": RED,
+    }
+
+    return colors.get(severity, RESET)
+
+
 def print_finding(finding: dict) -> None:
     """Print one static-analysis finding."""
 
     line = finding.get("line")
     location = finding.get("file", "<unknown file>")
+    severity = finding.get("severity", "UNKNOWN")
 
     if line is not None:
         location += f":{line}"
 
+    # Color the severity so important findings stand out in the terminal.
+    severity_text = (
+        f"{_severity_color(severity)}"
+        f"[{severity}]"
+        f"{RESET}"
+    )
+
     print(
-        f"[{finding.get('severity', 'UNKNOWN')}] "
+        f"{severity_text} "
         f"{finding.get('rule_id', '?')} "
         f"{finding.get('type', '?')}"
     )
@@ -287,20 +320,31 @@ def print_summary(findings: list[dict]) -> None:
         )
     )
 
+    # Use green when the scan is clean and red when errors were found.
+    if not findings:
+        summary_color = GREEN
+    elif counts.get("ERROR", 0) > 0:
+        summary_color = RED
+    else:
+        summary_color = YELLOW
+
     print(
+        f"{summary_color}{BOLD}"
         f"Summary: {total} finding(s) across "
         f"{len({finding.get('file') for finding in findings})} file(s)"
         f" — {breakdown}"
+        f"{RESET}"
     )
 
 
 def _print_header(title: str) -> None:
     """Print a human-readable section header."""
 
+    # Use cyan and bold to make major CLI sections easy to distinguish.
     print()
-    print("=" * 50)
-    print(title)
-    print("=" * 50)
+    print(f"{BOLD}{CYAN}" + "=" * 50 + f"{RESET}")
+    print(f"{BOLD}{CYAN}{title}{RESET}")
+    print(f"{BOLD}{CYAN}" + "=" * 50 + f"{RESET}")
 
 
 def investigate_findings(
@@ -308,14 +352,13 @@ def investigate_findings(
     *,
     show_progress: bool = True,
 ) -> tuple[list[dict], bool]:
-    """Send static findings to the AI investigator.
+    """Send static findings to the AI investigator concurrently.
 
     Returns a tuple of (results, interrupted). Failures investigating an
-    individual finding (API errors or unexpected exceptions) are isolated
-    so they don't abort investigation of the remaining findings. If the
-    user interrupts (Ctrl+C) partway through, any results already gathered
-    are preserved and returned rather than discarded, with `interrupted`
-    set to True.
+    individual finding are isolated so they don't abort investigation of the
+    remaining findings. If the user interrupts (Ctrl+C) partway through,
+    any results already gathered are preserved and returned rather than
+    discarded, with `interrupted` set to True.
     """
 
     results: list[dict] = []
@@ -324,41 +367,75 @@ def investigate_findings(
     if show_progress:
         _print_header("AI INVESTIGATION")
 
-    for finding in findings:
-        if show_progress:
-            print(
-                f"\nInvestigating {finding['rule_id']} "
-                f"in {finding['file']}..."
-            )
+    if not findings:
+        return results, interrupted
 
-        try:
-            result = investigate_file(finding)
+    # Run the independent API requests concurrently so five findings do not
+    # have to wait for five sequential ~10-second NVIDIA responses.
+    max_workers = min(5, len(findings))
 
-        except KeyboardInterrupt:
-            interrupted = True
-            if show_progress:
-                print("\nInterrupted. Keeping investigations completed so far.")
-            break
+    # Keep the finding index so completed results can be restored to the
+    # original static-analysis order instead of depending on completion order.
+    indexed_results: dict[int, dict] = {}
 
-        except InvestigatorAPIError as error:
-            if show_progress:
-                print(f"AI investigation failed: {error}")
-            continue
-
-        except Exception as error:  # noqa: BLE001
-            logger.exception(
-                "Unexpected error investigating %s", finding.get("file")
-            )
-            if show_progress:
-                print(f"AI investigation failed unexpectedly: {error}")
-            continue
-
-        results.append(
-            {
-                "finding": finding,
-                "investigation": result,
+    try:
+        # Create a small thread pool because these tasks are network-bound API
+        # requests rather than CPU-heavy work.
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(investigate_file, finding): index
+                for index, finding in enumerate(findings)
             }
-        )
+
+            # Process each investigation as soon as its API request finishes.
+            for future in as_completed(futures):
+                index = futures[future]
+                finding = findings[index]
+
+                if show_progress:
+                    print(
+                        f"\nInvestigating {finding['rule_id']} "
+                        f"in {finding['file']}..."
+                    )
+
+                try:
+                    result = future.result()
+
+                except InvestigatorAPIError as error:
+                    if show_progress:
+                        print(f"AI investigation failed: {error}")
+                    continue
+
+                except Exception as error:  # noqa: BLE001
+                    logger.exception(
+                        "Unexpected error investigating %s",
+                        finding.get("file"),
+                    )
+                    if show_progress:
+                        print(
+                            f"AI investigation failed unexpectedly: {error}"
+                        )
+                    continue
+
+                indexed_results[index] = {
+                    "finding": finding,
+                    "investigation": result,
+                }
+
+    except KeyboardInterrupt:
+        # Preserve investigations that completed before Ctrl+C and report
+        # that the AI investigation phase was interrupted.
+        interrupted = True
+
+        if show_progress:
+            print("\nInterrupted. Keeping investigations completed so far.")
+
+    # Restore the original finding order because futures finish at different
+    # times depending on the API response latency.
+    results = [
+        indexed_results[index]
+        for index in sorted(indexed_results)
+    ]
 
     return results, interrupted
 
@@ -483,6 +560,11 @@ def main() -> int:
             findings,
             show_progress=not args.json,
         )
+
+    # Display completed AI investigations only in human-readable mode.
+    if not args.json:
+        for result in investigation_results:
+            print_investigation(result["investigation"])
 
     summary = _build_summary(findings)
 
