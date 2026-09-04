@@ -15,6 +15,16 @@ dependencies = [
     "openai",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+examples = [
+    "Flask",
+    "razorpay",
+]
+
 [project.scripts]
 integration-doctor = "analyzer.scanner:main"
 
