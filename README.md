@@ -2,17 +2,19 @@
 
 Integration Doctor is a static-analysis tool for catching unsafe patterns in payment and webhook integrations before they turn into an incident.
 
-Payment integrations have a habit of looking fine at a glance while quietly missing something important — a signature check that never actually gets called, a webhook handler that'll happily process the same event twice, a retry loop with no idempotency key in sight. This tool scans your code and flags that stuff for review.
+Payment integrations can look fine at first while still missing something important. A signature check might never actually get called. A webhook handler might process the same event twice. A retry loop might repeat a payment operation without an idempotency key.
 
-Right now it looks at three things:
+Integration Doctor scans your code and flags those patterns for review.
+
+Right now it checks three main things:
 
 - Webhook signature verification
 - Duplicate webhook/event handling
 - Retry safety around payment operations
 
-There's also an optional AI layer on top. Once a detector flags something, you can have an AI model take a second look at the finding along with the actual source and give its own opinion — including telling you the detector got it wrong.
+There's also an optional AI layer. Once a detector flags something, you can have an AI model take a second look at the finding along with the relevant source code and repository context. It can agree with the detector or point out that the detector got it wrong.
 
-Integration Doctor isn't a replacement for your payment provider's SDK or docs. It's a second set of eyes on top of them.
+Integration Doctor is not a replacement for your payment provider's SDK or documentation. It's another layer of analysis on top of them.
 
 ---
 
@@ -20,15 +22,19 @@ Integration Doctor isn't a replacement for your payment provider's SDK or docs. 
 
 ### Webhook verification
 
-Webhook endpoints should confirm a request is genuinely coming from the provider before doing anything with it. The webhook detector looks at each handler and checks whether it's doing that — cryptographic comparison, a trusted SDK helper (`stripe.Webhook.construct_event`, etc.), that kind of thing.
+Webhook endpoints should verify that a request actually came from the payment provider before doing anything with it.
 
-It's static and heuristic, worth repeating: it doesn't run your code, and it can't prove verification is _correct_ at runtime, only that something that looks like verification is present.
+The webhook detector looks at each handler and checks for signs of verification. This can include cryptographic comparisons, trusted SDK helpers such as `stripe.Webhook.construct_event`, or other recognizable verification logic.
+
+The detector is static and heuristic. It does not run your code, so it cannot prove that verification is correct at runtime. It can only look for verification logic that it recognizes.
 
 ### Webhook idempotency
 
-Providers retry webhook deliveries. That's normal, expected behavior on their end — but it means the same event can hit your handler more than once. The idempotency detector looks for handlers that appear to mutate payment or order state without any visible guard against reprocessing an event it's already seen.
+Payment providers retry webhook deliveries. That's normal. It also means the same event can reach your handler more than once.
 
-It's looking for things like:
+The idempotency detector looks for webhook handlers that appear to change payment or order state without an obvious guard against processing the same event again.
+
+It looks for things such as:
 
 - `event_id`
 - `webhook_id`
@@ -37,13 +43,21 @@ It's looking for things like:
 
 ### Payment retries
 
-Retries are genuinely useful for temporary failures, but retrying a payment operation blindly can double-charge someone. The retry detector looks for functions that call something payment-related, retry it (via a loop or retry-flavored logic), and don't show any obvious protection — an idempotency key, backoff, `max_retries`, that sort of thing.
+Retries are useful for temporary failures, but blindly retrying a payment operation can result in the same operation happening more than once.
+
+The retry detector looks for functions that:
+
+1. Call something that appears to be payment-related
+2. Retry that operation through a loop or retry-style logic
+3. Do not show an obvious safety mechanism
+
+Examples of safety mechanisms include an idempotency key, backoff, or an explicit retry limit.
 
 ---
 
 ## How it works
 
-Under the hood it's all `ast` — the code is parsed, never executed.
+Under the hood, Integration Doctor uses Python's `ast` module. The source code is parsed and inspected. It is never executed.
 
 ```text
 Python project
@@ -58,42 +72,68 @@ Python project
   Findings
      |
      +-------> Human-readable output
+     |
      +-------> JSON output
+     |
      +-------> Optional AI investigation
 ```
 
-The detectors are deterministic — same code in, same findings out, every time. If AI investigation is turned on, each finding gets sent to the investigator along with the relevant source and some bounded repository context, and comes back with an independent read on whether it's actually a problem. The AI layer sits on top of the detectors rather than replacing them, on purpose — you still get repeatable results even without it.
+The detectors are deterministic. Given the same code, they produce the same findings.
+
+When AI investigation is enabled, each finding is sent to the investigator along with the relevant source file and a bounded amount of repository context. The AI then gives an independent assessment of the finding.
+
+The AI layer sits on top of the detectors rather than replacing them. You can still run the whole scanner without using an AI provider.
 
 ---
 
 ## Installation
 
+Clone the repository and create a virtual environment:
+
 ```bash
 git clone <repository-url>
 cd integration-doctor
+
 python -m venv .venv
 source .venv/bin/activate   # macOS/Linux
-pip install -r requirements.txt
 ```
+
+Install Integration Doctor in editable mode:
+
+```bash
+pip install -e .
+```
+
+Editable installation is useful during development because changes to the source code are picked up without reinstalling the package every time.
 
 ---
 
 ## Usage
 
+The main command is:
+
+```bash
+integration-doctor
+```
+
+With no target given, it scans `integrations/broken_webhook` by default.
+
+To scan another project or directory:
+
+```bash
+integration-doctor path/to/project
+```
+
+You can also run the scanner directly as a Python module:
+
 ```bash
 python -m analyzer.scanner
 ```
 
-With no target given, it scans `integrations/broken_webhook` by default. Point it somewhere else:
-
-```bash
-python -m analyzer.scanner path/to/project
-```
-
-Full options:
+### Command-line options
 
 ```text
-usage: scanner.py [-h] [--ai] [--json] [-v] [target]
+usage: integration-doctor [-h] [--ai] [--json] [-v] [--version] [target]
 
 Scan a repository for payment integration issues.
 
@@ -105,47 +145,74 @@ options:
   --ai           Run AI investigation on detected findings.
   --json         Emit machine-readable JSON output.
   -v, --verbose  Enable debug logging.
+  --version      Show the installed Integration Doctor version.
+```
+
+You can check the installed version with:
+
+```bash
+integration-doctor --version
 ```
 
 ---
 
 ## AI investigation
 
-Static analysis is good at spotting suspicious shapes in code, but a heuristic detector doesn't understand your architecture. It doesn't know that verification happens in middleware three files away. That's what the AI layer is for.
+Static analysis is good at spotting suspicious patterns in code, but a heuristic detector does not understand the whole architecture of an application.
+
+For example, a detector might not see that webhook verification happens in middleware or in another part of the repository. That's where the AI layer can help.
+
+Run a scan with AI investigation enabled:
 
 ```bash
-python -m analyzer.scanner integrations/broken_webhook --ai
+integration-doctor integrations/broken_webhook --ai
 ```
 
-The investigator gets the finding, the relevant source file, and bounded repository context, and returns:
+The investigator gets the finding, the relevant source file, and bounded repository context.
 
-- Verdict — `TRUE_POSITIVE`, `FALSE_POSITIVE`, or `UNCERTAIN`
+It returns:
+
+- Verdict
 - Confidence
 - Explanation
 - Evidence
 - Files examined
 
-It's specifically instructed not to just rubber-stamp the detector — if the code shows real evidence the control exists and is reachable, it'll call something a false positive.
+The AI is specifically instructed to investigate the finding rather than simply agree with the detector. If the source contains real evidence that the expected control exists and is reachable, the investigator can mark the finding as a false positive or as needing further review.
+
+The AI result is a second opinion. It is not treated as proof that an integration is secure.
 
 ### Providers
 
-Both Gemini and NVIDIA are supported.
+Both NVIDIA and Gemini are supported.
 
 The investigator can be configured through environment variables:
 
-````text
+```text
 AI_PROVIDER
 GEMINI_API_KEY
 GEMINI_MODEL
 NVIDIA_API_KEY
 NVIDIA_MODEL
+```
+
+If `AI_PROVIDER` is not set, Integration Doctor can select a provider based on which API key is available. NVIDIA is preferred when both providers are configured, with Gemini available as a fallback.
+
+For local development, keep API keys in a `.env` file. Do not commit that file.
+
+A `.env.example` file is included as a starting point.
+
 ---
 
 ## JSON output
 
+For scripts and CI pipelines, use `--json`:
+
 ```bash
-python -m analyzer.scanner integrations/broken_webhook --json
-````
+integration-doctor integrations/broken_webhook --json
+```
+
+The output follows a consistent structure:
 
 ```json
 {
@@ -163,37 +230,56 @@ python -m analyzer.scanner integrations/broken_webhook --json
 }
 ```
 
-Add `--ai` and the `investigations` array gets populated alongside the findings they correspond to. The shape stays the same whether or not anything was found — one less thing for downstream tooling to special-case.
+Add `--ai` and the `investigations` array is populated with the corresponding AI results.
+
+The overall JSON structure stays the same whether or not findings were detected, which makes it easier to consume from other tools.
 
 ---
 
 ## Exit codes
 
-| Code | Meaning                                      |
-| ---- | -------------------------------------------- |
-| `0`  | Clean scan, nothing found                    |
-| `1`  | Scan completed, findings exist               |
-| `2`  | Scanner couldn't complete (bad target, etc.) |
+| Code | Meaning                                               |
+| ---- | ----------------------------------------------------- |
+| `0`  | Clean scan, nothing found                             |
+| `1`  | Scan completed, findings exist                        |
+| `2`  | Scanner could not complete, such as an invalid target |
 
-A finding isn't a scanner failure — that's what exit code `1` is for. Makes it easy to wire into CI without treating "found something" the same as "broke."
+A finding is not considered a scanner failure. That's why a scan with findings returns `1` instead of `2`.
+
+This makes it possible to use Integration Doctor in CI without treating "something was found" as the same thing as "the scanner itself broke."
 
 ---
 
 ## What gets scanned
 
-Python files only, for now. These directories are skipped automatically:
+Python files are scanned for now.
+
+These directories are skipped automatically:
 
 ```text
-.git .venv venv __pycache__ node_modules
-.tox .pytest_cache .mypy_cache .ruff_cache
-build dist .eggs
+.git
+.venv
+venv
+__pycache__
+node_modules
+.tox
+.pytest_cache
+.mypy_cache
+.ruff_cache
+build
+dist
+.eggs
 ```
 
-Directories it can't read get skipped with a warning rather than killing the whole scan. Files that fail UTF-8 decoding, have invalid syntax, or trip up a detector unexpectedly show up as their own parser/error findings instead of crashing anything.
+Directories that cannot be read are skipped with a warning instead of stopping the whole scan.
+
+Files that cannot be decoded as UTF-8, contain invalid Python syntax, or cause an unexpected detector error are reported as parser or scanner findings instead of crashing the entire scan.
 
 ---
 
 ## Findings
+
+A finding looks roughly like this:
 
 ```json
 {
@@ -206,21 +292,27 @@ Directories it can't read get skipped with a warning rather than killing the who
 }
 ```
 
-| Field           | What it is                |
-| --------------- | ------------------------- |
-| `rule_id`       | which rule fired          |
-| `type`          | the specific issue        |
-| `severity`      | how bad, roughly          |
-| `file` / `line` | where                     |
-| `message`       | plain-English explanation |
+| Field           | What it is                          |
+| --------------- | ----------------------------------- |
+| `rule_id`       | Which rule fired                    |
+| `type`          | The specific issue                  |
+| `severity`      | How serious the issue appears to be |
+| `file` / `line` | Where it was found                  |
+| `message`       | Plain-English explanation           |
 
-Rule families right now: `WEBHOOK-*`, `PAYMENT-003`, `PARSER-*`.
+Current rule families include:
 
-One naming quirk worth flagging: `WEBHOOK-002` is the idempotency check, not `IDEMPOTENCY-*`. It got grouped under the `WEBHOOK-*` family early on since it's specifically about webhook duplicate-delivery safety, but it does mean rule-ID prefix matching elsewhere in the codebase needs to account for that if it's trying to route by concern rather than by exact ID.
+- `WEBHOOK-*`
+- `PAYMENT-003`
+- `PARSER-*`
+
+One naming detail worth mentioning: `WEBHOOK-002` is the idempotency check. It is not part of an `IDEMPOTENCY-*` rule family. It was grouped under `WEBHOOK-*` because the check is specifically about duplicate webhook delivery.
 
 ---
 
 ## Example integrations
+
+The repository includes a few small example integrations:
 
 ```text
 integrations/
@@ -233,11 +325,23 @@ integrations/
     └── middleware_verified.py
 ```
 
-Handy for sanity-checking the detectors against both the broken and the fixed versions of the same pattern:
+The examples make it easy to see what the detectors are looking for.
+
+For example, scan the intentionally broken integration:
 
 ```bash
-python -m analyzer.scanner integrations/broken_webhook
+integration-doctor integrations/broken_webhook
 ```
+
+Then scan the verified webhook example:
+
+```bash
+integration-doctor integrations/safe_webhook
+```
+
+The first should produce findings. The second is intended to show that recognizable webhook signature verification is accepted by the detector.
+
+The safe webhook example demonstrates signature verification specifically. It is not meant to represent a complete production payment integration.
 
 ---
 
@@ -272,65 +376,104 @@ integration-doctor/
 │   ├── test_scanner.py
 │   └── test_webhook_analyzer.py
 │
+├── pyproject.toml
 ├── requirements.txt
+├── .env.example
 ├── README.md
 └── .gitignore
 ```
 
-- **`analyzer/scanner.py`** — the entry point. Finds files, skips what should be skipped, checks for encoding/syntax problems, runs the detectors, optionally kicks off AI investigation, prints output, exits with the right code.
-- **`analyzer/detectors/`** — one file per class of problem.
-- **`analyzer/ai/`** — the optional layer: repository context, provider clients, structured results, error handling.
-- **`integrations/`** — sample apps used to exercise the detectors against.
-- **`tests/`** — coverage for all of the above.
+- **`analyzer/scanner.py`** is the main entry point. It finds files, skips directories that should not be scanned, checks for encoding and syntax problems, runs the detectors, optionally starts AI investigation, prints the results, and returns the appropriate exit code.
+
+- **`analyzer/detectors/`** contains the individual static-analysis rules.
+
+- **`analyzer/ai/`** contains the optional AI layer, including repository context, provider clients, structured results, and error handling.
+
+- **`integrations/`** contains the example applications used to exercise the detectors.
+
+- **`tests/`** contains the automated test suite.
+
+- **`pyproject.toml`** contains the package metadata, dependencies, version, and CLI entry point.
 
 ---
 
 ## Limitations
 
-The detectors are heuristics, not proofs. They read code shapes; they don't run the app or trace real execution.
+The detectors are heuristics, not proofs.
 
-A detector can miss verification that happens through a helper function, middleware, another module entirely, or some framework-specific abstraction it doesn't recognize. So a finding means "this is worth a look," not "this is definitely broken" — and no findings doesn't mean the integration is airtight, just that nothing obvious jumped out.
+They read code structure. They do not run the application or trace what happens during a real request.
 
-That's the actual goal here: catch the obvious stuff early and give you something concrete to go check, not replace a real security review.
+A detector can miss verification that happens through a helper function, middleware, another module, or a framework-specific abstraction that it does not recognize.
+
+The same goes for idempotency and retry safety. A control may exist somewhere the detector cannot see.
+
+So a finding means "this is worth checking," not "this is definitely broken."
+
+Likewise, getting no findings does not mean an integration is completely safe. It only means the scanner did not find anything that matched its current rules.
+
+That's the actual goal of the project: catch obvious problems early and give you something concrete to investigate. It is not meant to replace a proper security review.
 
 ---
 
 ## Testing
 
+Run the test suite with:
+
 ```bash
 pytest -q
 ```
 
-Covers the scanner, all three detectors, false-positive cases, repository context, and the AI investigator (mocked — no real API calls in the test suite).
+The tests cover the scanner, all three detectors, false-positive cases, repository context, and the AI investigator.
 
-After making changes:
+AI tests are mocked, so the test suite does not make real API calls.
+
+After making changes, run:
 
 ```bash
 pytest -q
 git diff --check
-python -m analyzer.scanner --help
+integration-doctor --help
 ```
+
+The GitHub Actions workflow also runs the test suite automatically on pushes and pull requests to `main`.
 
 ---
 
 ## Where things stand
 
-Working today:
+The core project is working.
 
-- AST-based static analysis for webhook signature, idempotency, and retry safety
-- Detector-level failure isolation (one bad detector doesn't take down the scan)
-- Parser/file-error handling
-- Human-readable and JSON output, with stable exit codes
-- Optional AI investigation via Gemini or NVIDIA
+Current functionality includes:
+
+- AST-based static analysis for webhook signature verification, idempotency, and retry safety
+- Detector-level failure isolation
+- Parser and file-error handling
+- Human-readable terminal output
+- JSON output
+- Stable exit codes
+- Optional AI investigation through NVIDIA or Gemini
 - Bounded repository context for the AI layer
-- A real test suite
+- Concurrent AI investigations
+- A packaged CLI command
+- Version reporting
+- Example broken and safer integrations
+- An automated test suite
+- GitHub Actions CI
 
-Next up is mostly polish: easier configuration, better detector coverage, cleaner reporting, and more realistic example integrations to test against.
+The current version is `0.1.0`.
+
+The next work is mostly release and distribution polish rather than adding another major feature.
 
 ---
 
 ## Scope
 
-Integration Doctor doesn't replace your payment provider's SDK, their webhook verification mechanism, their idempotency support, or their docs — those are still the source of truth for how the provider actually expects things to work.
+Integration Doctor does not replace your payment provider's SDK, webhook verification mechanism, idempotency support, or documentation.
 
-What it does is look at _your_ code and ask a narrower question: does this integration look like it's actually handling those safety concerns, or does it just look like it should?
+Those remain the source of truth for how a provider expects its integration to work.
+
+What Integration Doctor does is look at your code and ask a narrower question:
+
+> Does this integration appear to be handling these safety concerns, or does it only look like it should?
+
+That makes it useful as an early check during development, testing, and code review.

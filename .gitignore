@@ -4,3 +4,4 @@ __pycache__/
 .env
 .pytest_cache/
 nvidia_investigator_manual.py
+integration_doctor.egg-info/
