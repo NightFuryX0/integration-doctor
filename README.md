@@ -34,12 +34,12 @@ The goal is deliberately practical:
 
 ## What it catches
 
-| Rule | Area | What it looks for |
-|---|---|---|
-| `WEBHOOK-*` | Webhooks | Missing or ineffective signature verification |
-| `WEBHOOK-002` | Webhook idempotency | Payment or order state changes without an obvious duplicate-event guard |
-| `PAYMENT-003` | Payment retries | Retry behavior around payment operations without an obvious safety mechanism |
-| `PARSER-*` | Repository scanning | Source files that cannot be safely analyzed |
+| Rule          | Area                | What it looks for                                                            |
+| ------------- | ------------------- | ---------------------------------------------------------------------------- |
+| `WEBHOOK-*`   | Webhooks            | Missing or ineffective signature verification                                |
+| `WEBHOOK-002` | Webhook idempotency | Payment or order state changes without an obvious duplicate-event guard      |
+| `PAYMENT-003` | Payment retries     | Retry behavior around payment operations without an obvious safety mechanism |
+| `PARSER-*`    | Repository scanning | Source files that cannot be safely analyzed                                  |
 
 The rules are intentionally heuristic.
 
@@ -671,16 +671,16 @@ integration-doctor/
 
 The major pieces have deliberately different responsibilities:
 
-| Component | Responsibility |
-|---|---|
-| `scanner.py` | Repository scanning, orchestration, CLI, outputs and exit codes |
-| `detectors/` | Individual static-analysis rules |
-| `analysis/` | Symbols, resolution and call-graph reasoning |
-| `ai/` | Optional AI investigation |
-| `baseline.py` | Existing-finding filtering |
-| `config.py` | Project configuration |
-| `suppression.py` | Inline suppression handling |
-| `tests/` | Automated and evaluation coverage |
+| Component        | Responsibility                                                  |
+| ---------------- | --------------------------------------------------------------- |
+| `scanner.py`     | Repository scanning, orchestration, CLI, outputs and exit codes |
+| `detectors/`     | Individual static-analysis rules                                |
+| `analysis/`      | Symbols, resolution and call-graph reasoning                    |
+| `ai/`            | Optional AI investigation                                       |
+| `baseline.py`    | Existing-finding filtering                                      |
+| `config.py`      | Project configuration                                           |
+| `suppression.py` | Inline suppression handling                                     |
+| `tests/`         | Automated and evaluation coverage                               |
 
 ---
 
@@ -1006,7 +1006,9 @@ For security-sensitive rules, explain the limitation of the heuristic as well.
 
 # License
 
-Add the project's chosen license here before publishing the repository publicly.
+Integration Doctor is released under the **MIT License**.
+
+See the [`LICENSE`](LICENSE) file for the full license text.
 
 ---
 
