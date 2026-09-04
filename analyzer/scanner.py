@@ -1,4 +1,5 @@
 from __future__ import annotations
+from importlib.metadata import version as package_version
 from analyzer.detectors.retry import analyze_file as analyze_retry
 from analyzer.detectors.idempotency import analyze_file as analyze_idempotency
 from analyzer.detectors.webhook import analyze_file as analyze_webhook
@@ -516,6 +517,12 @@ def parse_arguments() -> argparse.Namespace:
         "--verbose",
         action="store_true",
         help="Enable debug logging.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"integration-doctor {package_version('integration-doctor')}",
+        help="Show the installed Integration Doctor version.",
     )
 
     return parser.parse_args()

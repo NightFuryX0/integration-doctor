@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "integration-doctor"
+version = "0.1.0"
+description = "Static analysis for unsafe payment and webhook integration patterns."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "python-dotenv",
+    "google-genai",
+    "pydantic",
+    "openai",
+]
+
+[project.scripts]
+integration-doctor = "analyzer.scanner:main"
+
+[tool.setuptools.packages.find]
+include = ["analyzer*"]
