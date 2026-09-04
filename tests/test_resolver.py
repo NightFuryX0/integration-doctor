@@ -454,3 +454,31 @@ def process():
 
     assert result.status == ResolutionStatus.RESOLVED
     assert result.targets == ("app.process",)
+
+
+def test_ambiguous_bare_name_is_unresolved(tmp_path: Path):
+    files = {
+        "app.py": """
+def webhook():
+    capture_payment()
+""",
+        "payments.py": """
+def capture_payment():
+    pass
+""",
+        "other.py": """
+def capture_payment():
+    pass
+""",
+    }
+
+    modules, resolver = build_analysis(tmp_path, files)
+
+    result = resolve_call(
+        modules,
+        resolver,
+        "app",
+        "capture_payment",
+    )
+
+    assert result.status == ResolutionStatus.UNRESOLVED

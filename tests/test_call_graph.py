@@ -11,8 +11,8 @@ from analyzer.analysis.models import (
     AnalysisModule,
     CallGraphEdge,
     CallSite,
-    ResolutionStatus,
     Symbol,
+    SymbolKind,
 )
 from analyzer.analysis.resolver import CallResolver
 from analyzer.analysis.symbols import build_symbol_table
@@ -533,52 +533,8 @@ def sink():
     )
 
 
-def test_find_paths_respects_max_depth(tmp_path: Path) -> None:
-    module = make_module(
-        tmp_path,
-        "graph.py",
-        """
-def first():
-    second()
-
-
-def second():
-    third()
-
-
-def third():
-    sink()
-
-
-def sink():
-    pass
-""",
-        "graph",
-    )
-
-    graph = build_graph([module])
-
-    assert graph.find_paths(
-        "graph.first",
-        "graph.sink",
-        max_depth=2,
-    ) == ()
-
-    assert graph.find_paths(
-        "graph.first",
-        "graph.sink",
-        max_depth=3,
-    ) == (
-        (
-            "graph.first",
-            "graph.second",
-            "graph.third",
-            "graph.sink",
-        ),
-    )
-
-
 def test_find_paths_respects_max_paths(tmp_path: Path) -> None:
+
     module = make_module(
         tmp_path,
         "graph.py",
@@ -616,6 +572,46 @@ def sink():
     )
 
     assert len(paths) == 2
+
+
+def test_find_paths_stops_at_one_path(tmp_path: Path) -> None:
+    module = make_module(
+        tmp_path,
+        "graph.py",
+        """
+def start():
+    one()
+    two()
+    three()
+
+
+def one():
+    sink()
+
+
+def two():
+    sink()
+
+
+def three():
+    sink()
+
+
+def sink():
+    pass
+""",
+        "graph",
+    )
+
+    graph = build_graph([module])
+
+    paths = graph.find_paths(
+        "graph.start",
+        "graph.sink",
+        max_paths=1,
+    )
+
+    assert len(paths) == 1
 
 
 def test_find_paths_source_equals_sink(tmp_path: Path) -> None:
@@ -789,3 +785,67 @@ def unused():
     assert stats.node_count == 4
     assert stats.edge_count == 1
     assert stats.recursive_edge_count == 0
+
+
+def test_find_paths_respects_max_depth():
+    graph = CallGraph()
+
+    for name in ["a", "b", "c", "d", "e"]:
+        symbol = Symbol(
+            qualified_name=name,
+            name=name,
+            kind=SymbolKind.FUNCTION,
+            file_path=Path(f"{name}.py"),
+            line=1,
+        )
+        graph.add_node(symbol)
+
+    for caller, callee in [("a", "b"), ("b", "c"), ("c", "d"), ("d", "e")]:
+        edge = CallGraphEdge(
+            caller=caller,
+            callee=callee,
+            call_site=CallSite(
+                caller=caller,
+                expression=callee,
+                file_path=Path(f"{caller}.py"),
+                line=1,
+                column=0,
+            ),
+        )
+        graph.add_edge(edge)
+
+    paths = graph.find_paths("a", "e", max_depth=3)
+
+    assert paths == ()
+
+
+def test_find_paths_allows_path_at_max_depth():
+    graph = CallGraph()
+
+    for name in ["a", "b", "c", "d", "e"]:
+        symbol = Symbol(
+            qualified_name=name,
+            name=name,
+            kind=SymbolKind.FUNCTION,
+            file_path=Path(f"{name}.py"),
+            line=1,
+        )
+        graph.add_node(symbol)
+
+    for caller, callee in [("a", "b"), ("b", "c"), ("c", "d"), ("d", "e")]:
+        edge = CallGraphEdge(
+            caller=caller,
+            callee=callee,
+            call_site=CallSite(
+                caller=caller,
+                expression=callee,
+                file_path=Path(f"{caller}.py"),
+                line=1,
+                column=0,
+            ),
+        )
+        graph.add_edge(edge)
+
+    paths = graph.find_paths("a", "e", max_depth=4)
+
+    assert paths == (("a", "b", "c", "d", "e"),)

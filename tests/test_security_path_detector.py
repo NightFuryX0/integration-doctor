@@ -725,3 +725,26 @@ def charge(request):
 
     assert finding["file"] == str(file_path.resolve())
     assert finding["line"] == 6
+
+
+def test_does_not_report_unrelated_function_with_webhook_in_name(
+    tmp_path: Path,
+) -> None:
+    """A helper containing 'webhook' in its name is not necessarily an entry point."""
+
+    write_file(
+        tmp_path,
+        "payments.py",
+        """
+def webhook_documentation():
+    charge()
+
+
+def charge():
+    pass
+""",
+    )
+
+    findings = run_detector(tmp_path)
+
+    assert_no_findings(findings)

@@ -1,7 +1,4 @@
-from pathlib import Path
-
 import pytest
-
 from analyzer.config import DEFAULT_IGNORED_DIRECTORIES, load_config
 
 

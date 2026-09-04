@@ -609,14 +609,6 @@ def test_serialize_investigation_supports_dict() -> None:
     }
 
 
-def test_serialize_investigation_supports_dict() -> None:
-    result = {"answer": "safe"}
-
-    assert scanner._serialize_investigation(result) == {
-        "answer": "safe"
-    }
-
-
 def test_serialize_investigation_returns_plain_values() -> None:
     assert scanner._serialize_investigation("safe") == "safe"
 

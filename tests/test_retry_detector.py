@@ -17,3 +17,33 @@ def test_does_not_flag_safe_payment_retry():
     )
 
     assert findings == []
+
+
+def test_does_not_flag_payment_loop_without_retry_behavior(tmp_path):
+    payment_file = tmp_path / "payments.py"
+    payment_file.write_text(
+        """
+def process_payments(payments):
+    for payment in payments:
+        capture_payment(payment)
+"""
+    )
+
+    findings = analyze_file(str(payment_file))
+
+    assert findings == []
+
+
+def test_does_not_flag_retry_word_in_comment_or_message(tmp_path):
+    payment_file = tmp_path / "payments.py"
+    payment_file.write_text(
+        """
+def process_payment(payment_id):
+    message = "Retry this request later"
+    capture_payment(payment_id)
+"""
+    )
+
+    findings = analyze_file(str(payment_file))
+
+    assert findings == []

@@ -1,4 +1,5 @@
 from analyzer.detectors.webhook import analyze_file
+import pytest
 
 
 def test_detects_missing_signature():
@@ -265,7 +266,12 @@ def test_invalid_syntax_raises_syntax_error(tmp_path):
 
 
 def test_legacy_webhook_analyzer_import_delegates_to_canonical_detector():
-    from analyzer import webhook_analyzer
+    with pytest.warns(
+        DeprecationWarning,
+        match="webhook_analyzer is a deprecated compatibility shim",
+    ):
+        from analyzer import webhook_analyzer
+
     from analyzer.detectors import webhook
 
     assert webhook_analyzer.analyze_file is webhook.analyze_file
@@ -296,3 +302,53 @@ def test_legacy_webhook_analyzer_import_produces_same_findings():
     canonical_findings = webhook.analyze_file(target)
 
     assert legacy_findings == canonical_findings
+
+
+def test_crypto_comparison_without_enforcement_is_not_trusted(tmp_path):
+    webhook_file = tmp_path / "webhook.py"
+    webhook_file.write_text(
+        """
+import hmac
+
+def webhook_handler(request):
+    signature = request.headers.get("X-Webhook-Signature")
+    expected = "expected-signature"
+
+    hmac.compare_digest(signature, expected)
+
+    process_event(request)
+"""
+    )
+
+    findings = analyze_file(str(webhook_file))
+
+    assert any(
+        finding["rule_id"] == "WEBHOOK-001"
+        for finding in findings
+    )
+
+
+def test_accepts_signature_after_simple_reassignment(tmp_path):
+    webhook_file = tmp_path / "webhook.py"
+    webhook_file.write_text(
+        """
+import hmac
+
+def webhook_handler(request):
+    signature = request.headers.get("X-Webhook-Signature")
+    sig = signature
+    expected = "expected-signature"
+
+    if hmac.compare_digest(sig, expected):
+        process_event(request)
+"""
+    )
+
+    findings = analyze_file(str(webhook_file))
+
+    assert not any(
+        finding["rule_id"] == "WEBHOOK-001" for finding in findings
+    )
+    assert not any(
+        finding["rule_id"] == "WEBHOOK-003" for finding in findings
+    )
