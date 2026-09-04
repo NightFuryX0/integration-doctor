@@ -18,6 +18,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest",
+    "ruff",
 ]
 
 examples = [
@@ -30,3 +31,7 @@ integration-doctor = "analyzer.scanner:main"
 
 [tool.setuptools.packages.find]
 include = ["analyzer*"]
+[tool.ruff.lint]
+select = ["F"]
+[tool.ruff.lint.per-file-ignores]
+"integrations/broken_webhook/app.py" = ["F811"]

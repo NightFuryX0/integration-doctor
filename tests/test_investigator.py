@@ -241,7 +241,6 @@ def test_nvidia_investigator_retries_on_503(monkeypatch):
 
     # Build a real InternalServerError (5xx) the way the openai SDK does,
     # rather than guessing its constructor signature.
-    mock_request = MagicMock()
     server_error = openai.InternalServerError(
         message="Service unavailable",
         response=MagicMock(status_code=503, headers={}),
