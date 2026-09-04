@@ -69,6 +69,10 @@ _TRUSTED_VERIFICATION_HELPERS = (
     "validate_webhook",
     "verify_signature",
     "verify_header",
+    # NEW: a couple more common naming conventions for the same concept,
+    # in the same spirit as the SDK/provider coverage already listed above.
+    "validate_signature",
+    "check_signature",
 )
 
 _WEBHOOK_NAME_INDICATOR = "webhook"
@@ -116,7 +120,14 @@ class WebhookDetector(ast.NodeVisitor):
             node, signature_vars
         )
 
-        if has_crypto_verification:
+        # NEW: also treat a bare (no-parentheses) verification decorator,
+        # e.g. `@verify_webhook_signature` applied directly to the handler,
+        # as satisfying verification. Such a decorator is an ast.Name in
+        # decorator_list rather than an ast.Call, so it was previously
+        # invisible to _has_cryptographic_verification (which only looks
+        # at ast.Call nodes) -- a handler protected entirely by a bare
+        # decorator would have been flagged as MISSING_WEBHOOK_SIGNATURE.
+        if has_crypto_verification or self._has_verification_decorator(node):
             return  # properly verified: no finding
 
         if has_header_read and self._has_weak_signature_usage(node, signature_vars):
@@ -165,6 +176,23 @@ class WebhookDetector(ast.NodeVisitor):
 
         for decorator in node.decorator_list:
             if _WEBHOOK_NAME_INDICATOR in _safe_unparse(decorator):
+                return True
+
+        return False
+
+    def _has_verification_decorator(
+        self, node: ast.FunctionDef | ast.AsyncFunctionDef
+    ) -> bool:
+        """True if the function is itself wrapped by something that looks
+        like a trusted verification decorator, used bare (no parentheses)
+        so it never appears as an ast.Call -- e.g. ``@verify_webhook``
+        rather than ``@verify_webhook()``.
+        """
+        for decorator in node.decorator_list:
+            decorator_text = _safe_unparse(decorator)
+            if not decorator_text:
+                continue
+            if any(ind in decorator_text for ind in _TRUSTED_VERIFICATION_HELPERS):
                 return True
 
         return False
@@ -242,22 +270,36 @@ class WebhookDetector(ast.NodeVisitor):
         the function from masking a genuinely unverified signature.
         """
         for call in self._iter_calls(node):
-            source = _safe_unparse(call)
-            if not source:
+            # NEW: identify "is this a verification call?" using ONLY the
+            # callee (call.func), not the full unparsed call including its
+            # arguments. Under the old logic, matching against the full
+            # call text meant something like
+            # `log.info("did not verify_signature for this request")`
+            # was indistinguishable from an actual verify_signature(...)
+            # call -- a log message could make the detector believe a
+            # completely unprotected webhook was verified.
+            func_source = _safe_unparse(call.func)
+            if not func_source:
                 continue
 
             is_crypto_call = any(
-                ind in source for ind in _CRYPTOGRAPHIC_VERIFICATION_INDICATORS
+                ind in func_source for ind in _CRYPTOGRAPHIC_VERIFICATION_INDICATORS
             )
             is_trusted_helper = any(
-                ind in source for ind in _TRUSTED_VERIFICATION_HELPERS
+                ind in func_source for ind in _TRUSTED_VERIFICATION_HELPERS
             )
             if not (is_crypto_call or is_trusted_helper):
                 continue
 
             if not signature_vars:
                 return True
-            if any(_contains_identifier(source, var) for var in signature_vars):
+
+            # For the "does this call actually use our signature variable?"
+            # check, the full call text (including arguments) is exactly
+            # what we want to search, since the variable appears as an
+            # argument, not as part of the callee.
+            full_source = _safe_unparse(call)
+            if any(_contains_identifier(full_source, var) for var in signature_vars):
                 return True
 
         return False

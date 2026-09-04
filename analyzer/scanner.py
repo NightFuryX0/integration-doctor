@@ -425,7 +425,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--ai",
         action="store_true",
-        help="Run Gemini investigation on detected findings.",
+        help="Run AI investigation on detected findings.",
     )
 
     parser.add_argument(
