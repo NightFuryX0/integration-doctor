@@ -13,6 +13,7 @@ dependencies = [
     "google-genai",
     "pydantic",
     "openai",
+    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
@@ -31,7 +32,9 @@ integration-doctor = "analyzer.scanner:main"
 
 [tool.setuptools.packages.find]
 include = ["analyzer*"]
+
 [tool.ruff.lint]
 select = ["F"]
+
 [tool.ruff.lint.per-file-ignores]
 "integrations/broken_webhook/app.py" = ["F811"]

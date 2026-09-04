@@ -9,7 +9,9 @@ Integration Doctor scans your code and flags those patterns for review.
 Right now it checks three main things:
 
 - Webhook signature verification
+
 - Duplicate webhook/event handling
+
 - Retry safety around payment operations
 
 There's also an optional AI layer. Once a detector flags something, you can have an AI model take a second look at the finding along with the relevant source code and repository context. It can agree with the detector or point out that the detector got it wrong.
@@ -37,8 +39,11 @@ The idempotency detector looks for webhook handlers that appear to change paymen
 It looks for things such as:
 
 - `event_id`
+
 - `webhook_id`
+
 - `already_processed` / `processed`
+
 - `idempotency`
 
 ### Payment retries
@@ -48,7 +53,9 @@ Retries are useful for temporary failures, but blindly retrying a payment operat
 The retry detector looks for functions that:
 
 1. Call something that appears to be payment-related
+
 2. Retry that operation through a loop or retry-style logic
+
 3. Do not show an obvious safety mechanism
 
 Examples of safety mechanisms include an idempotency key, backoff, or an explicit retry limit.
@@ -60,22 +67,39 @@ Examples of safety mechanisms include an idempotency key, backoff, or an explici
 Under the hood, Integration Doctor uses Python's `ast` module. The source code is parsed and inspected. It is never executed.
 
 ```text
+
 Python project
-     |
-     v
-  Scanner
-     |
-     v
-  Detectors
-     |
-     v
-  Findings
-     |
-     +-------> Human-readable output
-     |
-     +-------> JSON output
-     |
-     +-------> Optional AI investigation
+
+ |
+
+ v
+
+Scanner
+
+ |
+
+ v
+
+Detectors
+
+ |
+
+ v
+
+Findings
+
+ |
+
+ +-------> Human-readable output
+
+ |
+
+ +-------> JSON output
+
+ |
+
+ +-------> Optional AI investigation
+
 ```
 
 The detectors are deterministic. Given the same code, they produce the same findings.
@@ -91,17 +115,23 @@ The AI layer sits on top of the detectors rather than replacing them. You can st
 Clone the repository and create a virtual environment:
 
 ```bash
+
 git clone <repository-url>
+
 cd integration-doctor
 
 python -m venv .venv
+
 source .venv/bin/activate   # macOS/Linux
+
 ```
 
 Install Integration Doctor in editable mode:
 
 ```bash
+
 pip install -e .
+
 ```
 
 Editable installation is useful during development because changes to the source code are picked up without reinstalling the package every time.
@@ -113,7 +143,9 @@ Editable installation is useful during development because changes to the source
 The main command is:
 
 ```bash
+
 integration-doctor
+
 ```
 
 With no target given, it scans `integrations/broken_webhook` by default.
@@ -121,155 +153,170 @@ With no target given, it scans `integrations/broken_webhook` by default.
 To scan another project or directory:
 
 ```bash
+
 integration-doctor path/to/project
+
 ```
 
 You can also run the scanner directly as a Python module:
 
 ```bash
+
 python -m analyzer.scanner
+
 ```
 
 ### Command-line options
 
-```text
-usage: integration-doctor [-h] [--ai] [--json] [-v] [--version] [target]
+````text
+
+usage: integration-doctor [-h] [--ai] [--json] [-v] [--version]
+[--sarif] [--baseline PATH]
+[--generate-baseline PATH] [target]
 
 Scan a repository for payment integration issues.
 
 positional arguments:
-  target         Directory to scan.
+
+target                 Directory to scan.
 
 options:
-  -h, --help     show this help message and exit
-  --ai           Run AI investigation on detected findings.
-  --json         Emit machine-readable JSON output.
-  -v, --verbose  Enable debug logging.
-  --version      Show the installed Integration Doctor version.
-```
 
-You can check the installed version with:
+-h, --help             show this help message and exit
 
-```bash
-integration-doctor --version
-```
+--ai                   Run AI investigation on detected findings.
 
----
+--json                 Emit machine-readable JSON output.
 
-## AI investigation
+-v, --verbose          Enable debug logging.
 
-Static analysis is good at spotting suspicious patterns in code, but a heuristic detector does not understand the whole architecture of an application.
+--version              Show the installed Integration Doctor version.
 
-For example, a detector might not see that webhook verification happens in middleware or in another part of the repository. That's where the AI layer can help.
+--sarif                Emit SARIF 2.1.0 output.
 
-Run a scan with AI investigation enabled:
+--baseline PATH        Ignore findings already recorded in a baseline.
 
-```bash
-integration-doctor integrations/broken_webhook --ai
-```
+--generate-baseline PATH
+Write the current findings to a baseline file.
 
-The investigator gets the finding, the relevant source file, and bounded repository context.
+[tool.integration-doctor]
+exclude = [
+    "generated",
+    "legacy",
+]
 
-It returns:
+disabled_rules = [
+    "WEBHOOK-001",
+]
 
-- Verdict
-- Confidence
-- Explanation
-- Evidence
-- Files examined
+Excluding directories
 
-The AI is specifically instructed to investigate the finding rather than simply agree with the detector. If the source contains real evidence that the expected control exists and is reachable, the investigator can mark the finding as a false positive or as needing further review.
+Use exclude when there are directories you do not want Integration Doctor to scan.
 
-The AI result is a second opinion. It is not treated as proof that an integration is secure.
+These are added to the scanner's normal ignored directories. The built-in ignored directories are still skipped automatically.
 
-### Providers
+For example:
 
-Both NVIDIA and Gemini are supported.
+[tool.integration-doctor]
+exclude = [
+    "generated",
+    "vendor",
+]
 
-The investigator can be configured through environment variables:
+Disabling rules
 
-```text
-AI_PROVIDER
-GEMINI_API_KEY
-GEMINI_MODEL
-NVIDIA_API_KEY
-NVIDIA_MODEL
-```
+Use disabled_rules when you want to turn off a specific rule for a project.
 
-If `AI_PROVIDER` is not set, Integration Doctor can select a provider based on which API key is available. NVIDIA is preferred when both providers are configured, with Gemini available as a fallback.
+For example:
 
-For local development, keep API keys in a `.env` file. Do not commit that file.
+[tool.integration-doctor]
+disabled_rules = [
+    "WEBHOOK-001",
+]
 
-A `.env.example` file is included as a starting point.
+This disables that rule for the scan target. It does not disable the other rules.
 
----
+The configuration file is optional. If there is no integration-doctor.toml, Integration Doctor uses its normal defaults.
 
-## JSON output
+Suppressions
 
-For scripts and CI pipelines, use `--json`:
+Sometimes a finding is intentional or is handled somewhere else in the application. In those cases, you can suppress an individual finding directly in the source file.
 
-```bash
-integration-doctor integrations/broken_webhook --json
-```
+Use a comment with the rule ID:
 
-The output follows a consistent structure:
+# integration-doctor-ignore: WEBHOOK-001
+def webhook():
+    pass
 
-```json
-{
-  "findings": [],
-  "investigations": [],
-  "summary": {
-    "total": 0,
-    "files": 0,
-    "critical": 0,
-    "high": 0,
-    "medium": 0,
-    "low": 0,
-    "errors": 0
-  }
-}
-```
+You can also add a reason:
 
-Add `--ai` and the `investigations` array is populated with the corresponding AI results.
+# integration-doctor-ignore: WEBHOOK-001 -- verified in middleware
+def webhook():
+    pass
 
-The overall JSON structure stays the same whether or not findings were detected, which makes it easier to consume from other tools.
+The suppression applies to the comment's line or the immediately following source line.
 
----
+Suppressions are intentionally line-specific. They do not turn off a rule for the whole file.
 
-## Exit codes
+This is useful when you have checked a finding and want to keep the decision close to the code that caused the finding.
 
-| Code | Meaning                                               |
-| ---- | ----------------------------------------------------- |
-| `0`  | Clean scan, nothing found                             |
-| `1`  | Scan completed, findings exist                        |
-| `2`  | Scanner could not complete, such as an invalid target |
+Baselines
 
-A finding is not considered a scanner failure. That's why a scan with findings returns `1` instead of `2`.
+A baseline lets you accept findings that already exist in a project and focus future scans on new findings.
 
-This makes it possible to use Integration Doctor in CI without treating "something was found" as the same thing as "the scanner itself broke."
+First, create a baseline from the current scan:
 
----
+integration-doctor . --generate-baseline baseline.json
 
-## What gets scanned
+Integration Doctor writes the current findings to baseline.json.
+
+Later, scan the project with that baseline:
+
+integration-doctor . --baseline baseline.json
+
+Findings that are already in the baseline are filtered out. If nothing new has been introduced, the scan reports:
+
+No findings.
+
+If a new finding appears, it is still reported normally.
+
+This makes baselines useful when adding Integration Doctor to an existing project that already has findings. You can start with the current state instead of having to fix every existing finding before using the scanner in development or CI.
+
+--baseline and --generate-baseline cannot be used together.
+
+What gets scanned
 
 Python files are scanned for now.
 
 These directories are skipped automatically:
 
 ```text
+
 .git
+
 .venv
+
 venv
+
 __pycache__
+
 node_modules
+
 .tox
+
 .pytest_cache
+
 .mypy_cache
+
 .ruff_cache
+
 build
+
 dist
+
 .eggs
-```
+
+````
 
 Directories that cannot be read are skipped with a warning instead of stopping the whole scan.
 
@@ -284,26 +331,39 @@ A finding looks roughly like this:
 ```json
 {
   "rule_id": "WEBHOOK-001",
+
   "type": "MISSING_WEBHOOK_SIGNATURE",
+
   "severity": "CRITICAL",
+
   "file": "app.py",
+
   "line": 42,
+
   "message": "..."
 }
 ```
 
-| Field           | What it is                          |
+| Field | What it is |
+
 | --------------- | ----------------------------------- |
-| `rule_id`       | Which rule fired                    |
-| `type`          | The specific issue                  |
-| `severity`      | How serious the issue appears to be |
-| `file` / `line` | Where it was found                  |
-| `message`       | Plain-English explanation           |
+
+| `rule_id` | Which rule fired |
+
+| `type` | The specific issue |
+
+| `severity` | How serious the issue appears to be |
+
+| `file` / `line` | Where it was found |
+
+| `message` | Plain-English explanation |
 
 Current rule families include:
 
 - `WEBHOOK-*`
+
 - `PAYMENT-003`
+
 - `PARSER-*`
 
 One naming detail worth mentioning: `WEBHOOK-002` is the idempotency check. It is not part of an `IDEMPOTENCY-*` rule family. It was grouped under `WEBHOOK-*` because the check is specifically about duplicate webhook delivery.
@@ -315,14 +375,23 @@ One naming detail worth mentioning: `WEBHOOK-002` is the idempotency check. It i
 The repository includes a few small example integrations:
 
 ```text
+
 integrations/
+
 ├── broken_webhook/
+
 │   ├── app.py
+
 │   ├── duplicate_webhook.py
+
 │   ├── safe_retry.py
+
 │   └── unsafe_retry.py
+
 └── safe_webhook/
-    └── middleware_verified.py
+
+└── middleware\_verified.py
+
 ```
 
 The examples make it easy to see what the detectors are looking for.
@@ -330,13 +399,17 @@ The examples make it easy to see what the detectors are looking for.
 For example, scan the intentionally broken integration:
 
 ```bash
+
 integration-doctor integrations/broken_webhook
+
 ```
 
 Then scan the verified webhook example:
 
 ```bash
+
 integration-doctor integrations/safe_webhook
+
 ```
 
 The first should produce findings. The second is intended to show that recognizable webhook signature verification is accepted by the detector.
@@ -348,39 +421,73 @@ The safe webhook example demonstrates signature verification specifically. It is
 ## Project structure
 
 ```text
+
 integration-doctor/
+
 │
+
 ├── analyzer/
+
 │   ├── ai/
+
 │   │   ├── context.py
+
 │   │   ├── display.py
+
 │   │   └── investigator.py
+
 │   │
+
 │   ├── detectors/
+
 │   │   ├── webhook.py
+
 │   │   ├── idempotency.py
+
 │   │   └── retry.py
+
 │   │
+
 │   ├── scanner.py
+
 │   └── webhook_analyzer.py
+
 │
+
 ├── integrations/
+
 │   ├── broken_webhook/
+
 │   └── safe_webhook/
+
 │
+
 ├── tests/
+
 │   ├── test_context.py
+
 │   ├── test_false_positive.py
+
 │   ├── test_investigator.py
+
 │   ├── test_retry_detector.py
+
 │   ├── test_scanner.py
+
 │   └── test_webhook_analyzer.py
+
 │
+
 ├── pyproject.toml
+
 ├── requirements.txt
+
 ├── .env.example
+
 ├── README.md
+
 └── .gitignore
+
 ```
 
 - **`analyzer/scanner.py`** is the main entry point. It finds files, skips directories that should not be scanned, checks for encoding and syntax problems, runs the detectors, optionally starts AI investigation, prints the results, and returns the appropriate exit code.
@@ -420,7 +527,9 @@ That's the actual goal of the project: catch obvious problems early and give you
 Run the test suite with:
 
 ```bash
+
 pytest -q
+
 ```
 
 The tests cover the scanner, all three detectors, false-positive cases, repository context, and the AI investigator.
@@ -430,9 +539,13 @@ AI tests are mocked, so the test suite does not make real API calls.
 After making changes, run:
 
 ```bash
+
 pytest -q
+
 git diff --check
+
 integration-doctor --help
+
 ```
 
 The GitHub Actions workflow also runs the test suite automatically on pushes and pull requests to `main`.
@@ -446,18 +559,31 @@ The core project is working.
 Current functionality includes:
 
 - AST-based static analysis for webhook signature verification, idempotency, and retry safety
+
 - Detector-level failure isolation
+
 - Parser and file-error handling
+
 - Human-readable terminal output
+
 - JSON output
+
 - Stable exit codes
+
 - Optional AI investigation through NVIDIA or Gemini
+
 - Bounded repository context for the AI layer
+
 - Concurrent AI investigations
+
 - A packaged CLI command
+
 - Version reporting
+
 - Example broken and safer integrations
+
 - An automated test suite
+
 - GitHub Actions CI
 
 The current version is `0.1.0`.

@@ -2,10 +2,22 @@ from __future__ import annotations
 from importlib.metadata import version as package_version
 from analyzer.detectors.retry import analyze_file as analyze_retry
 from analyzer.detectors.idempotency import analyze_file as analyze_idempotency
+from analyzer.config import DEFAULT_IGNORED_DIRECTORIES, load_config
 from analyzer.detectors.webhook import analyze_file as analyze_webhook
+from analyzer.detectors.security_path import analyze_repository as analyze_security_paths
+from analyzer.analysis.repository import build_repository_analysis
 from analyzer.ai.investigator import (
     InvestigatorAPIError,
     investigate_file,
+)
+from analyzer.suppression import (
+    filter_suppressed_findings,
+    parse_suppressions,
+)
+from analyzer.baseline import (
+    filter_new_findings,
+    load_baseline,
+    save_baseline,
 )
 from analyzer.ai.display import print_investigation
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -28,21 +40,6 @@ CYAN = "\033[36m"
 GREEN = "\033[32m"
 
 
-IGNORED_DIRECTORIES = {
-    ".git",
-    ".venv",
-    "venv",
-    "__pycache__",
-    "node_modules",
-    ".tox",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".ruff_cache",
-    "build",
-    "dist",
-    ".eggs",
-}
-
 DETECTORS = (
     analyze_webhook,
     analyze_idempotency,
@@ -57,7 +54,10 @@ EXIT_ERROR = 2
 logger = logging.getLogger("integration_doctor")
 
 
-def find_python_files(root: str) -> list[Path]:
+def find_python_files(
+    root: str,
+    excluded_directories: set[str] | None = None,
+) -> list[Path]:
     """Find Python files while ignoring generated and dependency directories.
 
     Unreadable subdirectories (e.g. due to permissions) are skipped with a
@@ -71,6 +71,11 @@ def find_python_files(root: str) -> list[Path]:
 
     if not root_path.is_dir():
         raise NotADirectoryError(f"Scan target is not a directory: {root}")
+        # Combine Integration Doctor's safe built-in exclusions with any
+    # project-specific exclusions from integration-doctor.toml.
+    ignored_directories = DEFAULT_IGNORED_DIRECTORIES | (
+        excluded_directories or set()
+    )
 
     def _on_walk_error(error: OSError) -> None:
         logger.warning("Skipping unreadable path during scan: %s", error)
@@ -82,7 +87,9 @@ def find_python_files(root: str) -> list[Path]:
         # them at all (faster, and avoids matching filenames that merely
         # happen to sit inside an ignored directory further down the tree).
         dirnames[:] = sorted(
-            dirname for dirname in dirnames if dirname not in IGNORED_DIRECTORIES
+            dirname
+            for dirname in dirnames
+            if dirname not in ignored_directories
         )
 
         for filename in filenames:
@@ -212,12 +219,59 @@ def _detector_name(detector) -> str:
 
 
 def scan_repository(root: str) -> list[dict]:
-    """Run all deterministic detectors against a repository."""
+    """Run all deterministic detectors against a repository.
 
+    File-level detectors run against each Python file independently.
+    Repository-level detectors then consume one shared repository analysis so
+    expensive structures such as the symbol table, resolver, call graph, and
+    control-flow graphs are built only once.
+    """
+
+    # Load optional project configuration before scanning any files.
+    config = load_config(root)
+
+    # Built-in exclusions remain active while configured exclusions are added
+    # on top of them.
     findings: list[dict] = []
+    python_files = find_python_files(
+        root,
+        excluded_directories=config.exclude,
+    )
 
-    for file_path in find_python_files(root):
+    for file_path in python_files:
         findings.extend(_run_detectors_on_file(file_path))
+
+    # SECURITY-001 needs repository-wide context, so it cannot be executed
+    # through the per-file detector loop above.
+    #
+    # Skip repository construction for an empty repository. This keeps the
+    # existing empty-scan behavior simple and avoids building unnecessary
+    # analysis structures when there is nothing to analyze.
+    if python_files:
+        # The repository analysis API works with Path objects. Convert here
+        # because the scanner's public API intentionally accepts a string
+        # path for CLI compatibility.
+        analysis = build_repository_analysis(Path(root))
+        findings.extend(analyze_security_paths(analysis))
+
+    # Remove findings for rules that the project explicitly disabled.
+    findings = [
+        finding
+        for finding in findings
+        if finding.get("rule_id") not in config.disabled_rules
+    ]
+
+    # Read precise source-line suppressions after detection so every detector
+    # can continue to report normally before suppression is applied.
+    file_suppressions = {
+        str(file_path): parse_suppressions(file_path)
+        for file_path in python_files
+    }
+
+    findings = filter_suppressed_findings(
+        findings,
+        file_suppressions=file_suppressions,
+    )
 
     return findings
 
@@ -441,6 +495,87 @@ def investigate_findings(
     return results, interrupted
 
 
+def _build_sarif(findings):
+    """Build a SARIF 2.1.0 document from scanner findings."""
+    results = []
+    rules = {}
+
+    for finding in findings:
+        rule_id = finding.get("rule_id", "UNKNOWN")
+        severity = str(finding.get("severity", "LOW")).upper()
+
+        # SARIF uses error, warning, and note as its standard levels.
+        if severity in {"CRITICAL", "HIGH", "ERROR"}:
+            level = "error"
+        elif severity == "MEDIUM":
+            level = "warning"
+        else:
+            level = "note"
+
+        result = {
+            "ruleId": rule_id,
+            "level": level,
+            "message": {
+                "text": finding.get("message", "")
+            },
+        }
+
+        file_path = finding.get("file")
+        line = finding.get("line")
+
+        if file_path:
+            region = {}
+
+            if isinstance(line, int) and line > 0:
+                region["startLine"] = line
+
+            location = {
+                "physicalLocation": {
+                    "artifactLocation": {
+                        "uri": str(file_path)
+                    }
+                }
+            }
+
+            if region:
+                location["physicalLocation"]["region"] = region
+
+            result["locations"] = [location]
+
+        results.append(result)
+
+        if rule_id not in rules:
+            rules[rule_id] = {
+                "id": rule_id,
+                "name": finding.get("type", rule_id),
+                "shortDescription": {
+                    "text": finding.get("message", rule_id)
+                },
+            }
+
+    return {
+        "version": "2.1.0",
+        "$schema": (
+            "https://json.schemastore.org/sarif-2.1.0.json"
+        ),
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "name": "Integration Doctor",
+                        "informationUri": (
+                            "https://github.com/"
+                            "integration-doctor"
+                        ),
+                        "rules": list(rules.values()),
+                    }
+                },
+                "results": results,
+            }
+        ],
+    }
+
+
 def _serialize_investigation(result):
     """Convert an investigation result into JSON-compatible data."""
 
@@ -511,6 +646,23 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         help="Emit machine-readable JSON output.",
     )
+    parser.add_argument(
+        "--sarif",
+        action="store_true",
+        help="Emit SARIF 2.1.0 output.",
+    )
+
+    baseline_group = parser.add_mutually_exclusive_group()
+    baseline_group.add_argument(
+        "--baseline",
+        metavar="PATH",
+        help="Ignore findings already recorded in a baseline file.",
+    )
+    baseline_group.add_argument(
+        "--generate-baseline",
+        metavar="PATH",
+        help="Write the current findings to a baseline file and exit.",
+    )
 
     parser.add_argument(
         "-v",
@@ -541,7 +693,7 @@ def main() -> int:
     try:
         findings = scan_repository(args.target)
 
-    except (FileNotFoundError, NotADirectoryError) as error:
+    except (FileNotFoundError, NotADirectoryError, ValueError) as error:
         if args.json:
             print(
                 json.dumps(
@@ -554,10 +706,128 @@ def main() -> int:
                     indent=2,
                 )
             )
+        elif args.sarif:
+            # Keep SARIF output machine-readable even when the scan cannot
+            # start because the target or configuration is invalid.
+            print(
+                json.dumps(
+                    {
+                        "version": "2.1.0",
+                        "$schema": (
+                            "https://json.schemastore.org/"
+                            "sarif-2.1.0.json"
+                        ),
+                        "runs": [
+                            {
+                                "tool": {
+                                    "driver": {
+                                        "name": "Integration Doctor",
+                                    }
+                                },
+                                "results": [],
+                            }
+                        ],
+                    },
+                    indent=2,
+                )
+            )
         else:
             print(f"Error: {error}")
 
         return EXIT_ERROR
+
+    if getattr(args, "generate_baseline", None):
+        try:
+            save_baseline(findings, args.generate_baseline)
+        except (OSError, ValueError) as error:
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "findings": [],
+                            "investigations": [],
+                            "summary": _build_summary(findings),
+                            "error": str(error),
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                print(f"Error: Could not generate baseline: {error}")
+
+            return EXIT_ERROR
+
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "findings": findings,
+                        "investigations": [],
+                        "summary": _build_summary(findings),
+                        "baseline": {
+                            "generated": True,
+                            "path": str(args.generate_baseline),
+                        },
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            print(
+                f"Baseline written to {args.generate_baseline} "
+                f"({len(findings)} finding(s))."
+            )
+
+        return EXIT_CLEAN
+
+    if getattr(args, "baseline", None):
+        try:
+            baseline_fingerprints = load_baseline(args.baseline)
+        except ValueError as error:
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "findings": [],
+                            "investigations": [],
+                            "summary": _build_summary([]),
+                            "error": str(error),
+                        },
+                        indent=2,
+                    )
+                )
+            elif args.sarif:
+                print(
+                    json.dumps(
+                        {
+                            "version": "2.1.0",
+                            "$schema": (
+                                "https://json.schemastore.org/"
+                                "sarif-2.1.0.json"
+                            ),
+                            "runs": [
+                                {
+                                    "tool": {
+                                        "driver": {
+                                            "name": "Integration Doctor",
+                                        }
+                                    },
+                                    "results": [],
+                                }
+                            ],
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                print(f"Error: {error}")
+
+            return EXIT_ERROR
+
+        findings = filter_new_findings(
+            findings,
+            baseline_fingerprints,
+        )
 
     investigation_results: list[dict] = []
     investigation_interrupted = False
@@ -574,6 +844,9 @@ def main() -> int:
             print_investigation(result["investigation"])
 
     summary = _build_summary(findings)
+    if args.sarif:
+        print(json.dumps(_build_sarif(findings), indent=2))
+        return EXIT_FINDINGS if findings else EXIT_CLEAN
 
     if args.json:
         output: dict = {

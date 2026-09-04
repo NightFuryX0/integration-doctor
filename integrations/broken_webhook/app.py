@@ -21,17 +21,6 @@ def webhook_handler(request):
     return {"status": "ok"}
 
 
-def process_event(request):
-    payload = request.body
-    print(f"Processing payment event: {payload}")
-
-
-def webhook_handler(request):
-    # No signature is read or checked at all before acting on the payload.
-    process_event(request)
-    return {"status": "ok"}
-
-
 @app.route("/webhook", methods=["POST"])
 def webhook():
     event = request.get_json()
