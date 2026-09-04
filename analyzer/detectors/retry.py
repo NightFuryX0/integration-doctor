@@ -61,14 +61,34 @@ class RetryDetector(ast.NodeVisitor):
         return False
 
     def _contains_retry_logic(self, node: ast.FunctionDef) -> bool:
-        """Check whether the function appears to contain retry behavior."""
+        """Check whether the function contains explicit retry behavior."""
 
-        source = ast.unparse(node).lower()
+        # FIX: Inspect Python identifiers and function calls instead of the
+        # entire source text, so words inside strings are not treated as retry logic.
+        for child in ast.walk(node):
+            # FIX: Function and variable names provide stronger evidence of
+            # retry behavior than arbitrary text inside the function.
+            if isinstance(child, ast.Name):
+                name = child.id.lower()
 
-        return any(
-            indicator in source
-            for indicator in self.RETRY_INDICATORS
-        ) or self._contains_loop(node)
+                if any(
+                    indicator in name
+                    for indicator in self.RETRY_INDICATORS
+                ):
+                    return True
+
+            # FIX: Also recognize retry-related function calls such as
+            # retry() without matching unrelated string contents.
+            if isinstance(child, ast.Call):
+                call_text = ast.unparse(child.func).lower()
+
+                if any(
+                    indicator in call_text
+                    for indicator in self.RETRY_INDICATORS
+                ):
+                    return True
+
+        return False
 
     def _contains_loop(self, node: ast.FunctionDef) -> bool:
         """Check for loops that could be used to repeat an operation."""

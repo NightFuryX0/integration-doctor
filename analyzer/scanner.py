@@ -563,10 +563,6 @@ def _build_sarif(findings):
                 "tool": {
                     "driver": {
                         "name": "Integration Doctor",
-                        "informationUri": (
-                            "https://github.com/"
-                            "integration-doctor"
-                        ),
                         "rules": list(rules.values()),
                     }
                 },

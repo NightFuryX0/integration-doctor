@@ -324,8 +324,10 @@ def _matches_any_pattern(
 
     lowered_name = name.lower()
 
+    # FIX: Match the complete function name instead of treating a substring
+    # such as "webhook" inside "webhook_documentation" as an entry point.
     return any(
-        pattern.lower() in lowered_name
+        lowered_name == pattern.lower()
         for pattern in patterns
     )
 

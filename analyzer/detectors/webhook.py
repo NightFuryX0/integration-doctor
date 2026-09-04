@@ -13,7 +13,13 @@ handlers which either:
 Design notes / known limitations
 ---------------------------------
 This is a heuristic textual/AST pattern matcher, not a data-flow analyzer.
-It cannot follow a signature value across variable reassignment chains,
+# FIX: Update the documented limitation because the detector now follows
+# simple local signature aliases, while still not performing full data-flow.
+This is a heuristic textual/AST pattern matcher, not a full data-flow analyzer.
+It can follow simple local signature variable reassignments, but it cannot
+follow values through helper modules or across function boundaries. Treat
+findings as leads for review, not as ground truth, and expect some false
+negatives on unusual code shapes.,
 through helper modules, or across function boundaries. Treat findings as
 leads for review, not as ground truth, and expect some false negatives on
 unusual code shapes.
@@ -124,6 +130,10 @@ class WebhookDetector(ast.NodeVisitor):
             return
 
         signature_vars = self._find_signature_variable_names(node)
+        signature_vars = self._expand_signature_variable_names(
+            node,
+            signature_vars,
+        )
         has_header_read = self._has_signature_header_read(node, signature_vars)
         has_crypto_verification = self._has_cryptographic_verification(
             node, signature_vars
@@ -143,7 +153,24 @@ class WebhookDetector(ast.NodeVisitor):
         ):
             return  # properly verified: no finding
 
-        if has_header_read and self._has_weak_signature_usage(node, signature_vars):
+        # FIX: A standalone cryptographic comparison whose result is ignored
+        # does not verify the webhook, so report it as missing verification.
+        if self._has_unenforced_crypto_verification(node, signature_vars):
+            self._add_finding(
+                rule_id=RULE_MISSING_SIGNATURE,
+                finding_type="MISSING_WEBHOOK_SIGNATURE",
+                severity=SEVERITY_CRITICAL,
+                line=node.lineno,
+                message=(
+                    "Webhook endpoint processes incoming payment events without "
+                    "apparent signature verification."
+                ),
+            )
+            return
+
+        if has_header_read and self._has_weak_signature_usage(
+            node, signature_vars
+        ):
             self._add_finding(
                 rule_id=RULE_WEAK_SIGNATURE,
                 finding_type="WEAK_WEBHOOK_SIGNATURE_VERIFICATION",
@@ -338,6 +365,41 @@ class WebhookDetector(ast.NodeVisitor):
             if isinstance(child, ast.Call):
                 yield child
 
+    def _has_crypto_call_in_condition(
+        self, condition: ast.AST, signature_vars: set[str]
+    ) -> bool:
+        """Return True when a crypto/helper call is used inside a condition."""
+        for call in self._iter_calls(condition):
+            func_source = _safe_unparse(call.func)
+
+            if not func_source:
+                continue
+
+            is_crypto_call = any(
+                ind in func_source
+                for ind in _CRYPTOGRAPHIC_VERIFICATION_INDICATORS
+            )
+            is_trusted_helper = any(
+                ind in func_source
+                for ind in _TRUSTED_VERIFICATION_HELPERS
+            )
+
+            if not (is_crypto_call or is_trusted_helper):
+                continue
+
+            if not signature_vars:
+                return True
+
+            full_source = _safe_unparse(call)
+
+            if any(
+                _contains_identifier(full_source, var)
+                for var in signature_vars
+            ):
+                return True
+
+        return False
+
     def _looks_like_signature_header_read(self, call: ast.Call) -> bool:
         """True for a call that is *itself* a header lookup carrying a
         signature, e.g. ``request.headers.get("X-Signature")``.
@@ -388,6 +450,40 @@ class WebhookDetector(ast.NodeVisitor):
 
         return names
 
+    # FIX: Follow simple local assignments so a signature alias is treated
+    # as the same signature value during verification checks.
+    def _expand_signature_variable_names(
+        self,
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+        signature_vars: set[str],
+    ) -> set[str]:
+        """Follow simple local assignments derived from known signature variables."""
+        expanded = set(signature_vars)
+
+        changed = True
+        while changed:
+            changed = False
+
+            for child in ast.walk(node):
+                if not isinstance(child, ast.Assign):
+                    continue
+
+                if not isinstance(child.value, ast.Name):
+                    continue
+
+                if child.value.id not in expanded:
+                    continue
+
+                for target in child.targets:
+                    if not isinstance(target, ast.Name):
+                        continue
+
+                    if target.id not in expanded:
+                        expanded.add(target.id)
+                        changed = True
+
+        return expanded
+
     def _has_signature_header_read(
         self, node: ast.AST, signature_vars: set[str]
     ) -> bool:
@@ -398,42 +494,128 @@ class WebhookDetector(ast.NodeVisitor):
     def _has_cryptographic_verification(
         self, node: ast.AST, signature_vars: set[str]
     ) -> bool:
-        """True only if a real verification call is found, and — when we
-        know the signature's variable name — that call actually references
-        it. This prevents an unrelated ``compare_digest`` call elsewhere in
-        the function from masking a genuinely unverified signature.
-        """
+        """True when a real verification operation is found."""
+
+        # FIX: Trusted SDK/helper calls can perform verification internally,
+        # so they remain valid even when they are standalone calls.
         for call in self._iter_calls(node):
-            # NEW: identify "is this a verification call?" using ONLY the
-            # callee (call.func), not the full unparsed call including its
-            # arguments. Under the old logic, matching against the full
-            # call text meant something like
-            # `log.info("did not verify_signature for this request")`
-            # was indistinguishable from an actual verify_signature(...)
-            # call -- a log message could make the detector believe a
-            # completely unprotected webhook was verified.
             func_source = _safe_unparse(call.func)
             if not func_source:
                 continue
 
             is_crypto_call = any(
-                ind in func_source for ind in _CRYPTOGRAPHIC_VERIFICATION_INDICATORS
+                ind in func_source
+                for ind in _CRYPTOGRAPHIC_VERIFICATION_INDICATORS
             )
             is_trusted_helper = any(
-                ind in func_source for ind in _TRUSTED_VERIFICATION_HELPERS
+                ind in func_source
+                for ind in _TRUSTED_VERIFICATION_HELPERS
             )
-            if not (is_crypto_call or is_trusted_helper):
+
+            # FIX: Trusted SDK/helper calls can perform verification on their
+            # own, so a standalone trusted helper is valid verification.
+            if is_trusted_helper:
+                if not signature_vars:
+                    return True
+
+                full_source = _safe_unparse(call)
+
+                if any(
+                    _contains_identifier(full_source, var)
+                    for var in signature_vars
+                ):
+                    return True
+
                 continue
 
-            if not signature_vars:
+            # FIX: A raw crypto comparison only counts as verification when
+            # its result is actually used as a condition. A standalone
+            # compare_digest() call has its result ignored and must not
+            # suppress WEBHOOK-001.
+            if is_crypto_call:
+                if self._is_call_inside_verification_condition(node, call):
+                    if not signature_vars:
+                        return True
+
+                    full_source = _safe_unparse(call)
+
+                    if any(
+                        _contains_identifier(full_source, var)
+                        for var in signature_vars
+                    ):
+                        return True
+
+                continue
+
+        # FIX: A condition expression can be passed directly here by the
+        # decorator checks, so inspect that expression as a real condition.
+        if isinstance(node, ast.expr):
+            return self._has_crypto_call_in_condition(
+                node,
+                signature_vars,
+            )
+
+        # FIX: When given a whole function or decorator definition, inspect
+        # only actual condition expressions. Standalone crypto calls elsewhere
+        # in the function do not count as effective verification.
+        for child in ast.walk(node):
+            if isinstance(child, (ast.If, ast.IfExp, ast.Assert)):
+                if self._has_crypto_call_in_condition(
+                    child.test,
+                    signature_vars,
+                ):
+                    return True
+
+        return False
+
+    def _has_unenforced_crypto_verification(
+        self, node: ast.AST, signature_vars: set[str]
+    ) -> bool:
+        """Return True when a crypto comparison is made but its result is ignored."""
+
+        for call in self._iter_calls(node):
+            func_source = _safe_unparse(call.func)
+            if not func_source:
+                continue
+
+            # FIX: Only raw cryptographic comparisons need this check.
+            # Trusted SDK/helper calls are handled separately because they
+            # perform verification internally.
+            if not any(
+                ind in func_source
+                for ind in _CRYPTOGRAPHIC_VERIFICATION_INDICATORS
+            ):
+                continue
+
+            if signature_vars:
+                full_source = _safe_unparse(call)
+
+                if not any(
+                    _contains_identifier(full_source, var)
+                    for var in signature_vars
+                ):
+                    continue
+
+            # FIX: If the comparison is not inside a condition, its result
+            # is being ignored and therefore cannot protect the webhook.
+            if not self._is_call_inside_verification_condition(node, call):
                 return True
 
-            # For the "does this call actually use our signature variable?"
-            # check, the full call text (including arguments) is exactly
-            # what we want to search, since the variable appears as an
-            # argument, not as part of the callee.
-            full_source = _safe_unparse(call)
-            if any(_contains_identifier(full_source, var) for var in signature_vars):
+        return False
+
+    def _is_call_inside_verification_condition(
+        self, node: ast.AST, target_call: ast.Call
+    ) -> bool:
+        """Return True when a call appears inside an execution condition."""
+
+        for child in ast.walk(node):
+            if not isinstance(child, (ast.If, ast.IfExp, ast.Assert)):
+                continue
+
+            if any(
+                candidate is target_call
+                for candidate in self._iter_calls(child.test)
+            ):
                 return True
 
         return False
@@ -447,6 +629,17 @@ class WebhookDetector(ast.NodeVisitor):
         timing-unsafe checks like ``signature == expected``).
         """
         candidates: list[ast.AST] = []
+        # FIX: Track conditions that already contain real cryptographic
+        # verification so they are not also classified as weak usage.
+        verified_conditions: set[int] = set()
+
+        for child in ast.walk(node):
+            if isinstance(child, (ast.If, ast.IfExp, ast.Assert)):
+                if self._has_crypto_call_in_condition(
+                    child.test,
+                    signature_vars,
+                ):
+                    verified_conditions.add(id(child.test))
         for child in ast.walk(node):
             if isinstance(child, (ast.If, ast.IfExp)):
                 candidates.append(child.test)
@@ -460,6 +653,10 @@ class WebhookDetector(ast.NodeVisitor):
                 candidates.append(child)
 
         for candidate in candidates:
+            # FIX: Skip conditions that contain a real cryptographic
+            # verification call.
+            if id(candidate) in verified_conditions:
+                continue
             text = _safe_unparse(candidate)
             if not text:
                 continue
